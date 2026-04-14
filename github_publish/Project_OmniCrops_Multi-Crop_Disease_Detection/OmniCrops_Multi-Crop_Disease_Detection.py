@@ -321,7 +321,7 @@ def augment_image(img: Image.Image, aug_id: int) -> Image.Image:
         lambda i: i.rotate(-30, expand=False, fillcolor=(0, 0, 0)),
         lambda i: ImageEnhance.Brightness(i).enhance(b),
         lambda i: ImageEnhance.Contrast(i).enhance(c),
-        lambda i: ImageEnhance.Saturation(i).enhance(s),
+        lambda i: ImageEnhance.Color(i).enhance(s),
         lambda i: ImageEnhance.Sharpness(i).enhance(sh),
         lambda i: i.filter(ImageFilter.GaussianBlur(radius=blur_r)),
         lambda i: ImageOps.autocontrast(i),
@@ -647,6 +647,8 @@ if os.environ.get("OMNICROPS_FAST_TTA", "").lower() in ("1", "true", "yes"):
     print(f"✅ Transforms ready | TTA: {len(tta_tfs)}× (OMNICROPS_FAST_TTA)")
 else:
     print(f"✅ Transforms ready | TTA: {len(tta_tfs)}×")
+USE_TTA = os.environ.get("OMNICROPS_USE_TTA", "1").lower() in ("1", "true", "yes")
+print(f"   TTA enabled: {'YES' if USE_TTA else 'NO (standard test eval only)'}")
 
 
 # ImageFolder-style dataset
@@ -970,9 +972,9 @@ def train_epoch(model, loader, crit, opt, epoch, scaler, use_amp):
 
         if use_amp:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
+            scaler.step(opt)
             scaler.update()
         else:
             loss.backward()
@@ -1062,7 +1064,7 @@ print(f"\n✅ Best model loaded from ep{stopper.best_ep}")
 
 # Training curves
 ep = range(1, len(history['tl']) + 1)
-fig, axes = plt.subplots(1, 3, figsize=(21, 5))
+fig, axes = plt.subplots(1, 4, figsize=(24, 5))
 
 axes[0].plot(ep, history['tl'], 'b-o', ms=3, label='Train')
 axes[0].plot(ep, history['vl'], 'r-o', ms=3, label='Val')
@@ -1082,10 +1084,28 @@ axes[2].axvline(stopper.best_ep, color='green', ls='--')
 axes[2].set_title("F1-Score (Macro) ↑", fontweight='bold'); axes[2].legend()
 axes[2].grid(alpha=0.4)
 
+axes[3].plot(ep, history['lr_head'], 'k-', lw=2, label='Head LR')
+axes[3].set_title("Learning Rate (head)", fontweight='bold'); axes[3].legend()
+axes[3].grid(alpha=0.4)
+
 plt.suptitle("OmniCrops-SwinV2+FPN Training Curves", fontsize=14, fontweight='bold')
 plt.tight_layout()
-print("\n▶ Figure (train): training_curves — loss / acc / val F1")
+print("\n▶ Figure (train): training_curves — loss / acc / val F1 / LR")
 save_fig_notebook(fig, FIG_DIR / "training_curves.png", dpi=120)
+
+
+@torch.no_grad()
+def collect_probs_loader(model, loader, use_amp=False):
+    """Collect class probabilities and labels from a dataloader."""
+    model.eval()
+    probs_all, labels_all = [], []
+    for imgs, labels in tqdm(loader, desc="Collect probs", leave=False):
+        imgs = imgs.to(DEVICE, non_blocking=True)
+        with autocast(enabled=use_amp):
+            out = model(imgs)
+        probs_all.append(F.softmax(out, dim=1).cpu().numpy())
+        labels_all.append(labels.numpy())
+    return np.concatenate(probs_all, axis=0), np.concatenate(labels_all, axis=0)
 
 
 @torch.no_grad()
@@ -1109,24 +1129,34 @@ def tta_collect_probs(model, ds, tta_transforms, use_amp=False):
     return np.stack(probs_all), np.array(labels_all)
 
 
-print(f"\n🔍 TTA (×{len(tta_tfs)}) on test set...")
-tta_probs, tta_labels = tta_collect_probs(model, test_ds, tta_tfs, use_amp=USE_AMP)
-tta_preds = tta_probs.argmax(axis=1)
-tta_acc = accuracy_score(tta_labels, tta_preds) * 100
-tta_f1 = f1_score(tta_labels, tta_preds, average="macro") * 100
-print(f"   TTA Accuracy : {tta_acc:.4f}%")
-print(f"   TTA F1 Macro : {tta_f1:.4f}%")
-
-_, std_acc, std_f1, _, _ = evaluate(model, test_loader, use_amp=USE_AMP)
+std_probs, std_labels = collect_probs_loader(model, test_loader, use_amp=USE_AMP)
+std_preds = std_probs.argmax(axis=1)
+std_acc = accuracy_score(std_labels, std_preds) * 100
+std_f1 = f1_score(std_labels, std_preds, average="macro") * 100
 print(f"   Std Accuracy : {std_acc:.4f}%")
 print(f"   Std F1 Macro : {std_f1:.4f}%")
 
-per_f1 = f1_score(tta_labels, tta_preds, average=None, zero_division=0) * 100
+tta_acc, tta_f1 = std_acc, std_f1
+if USE_TTA:
+    print(f"\n🔍 TTA (×{len(tta_tfs)}) on test set...")
+    tta_probs, tta_labels = tta_collect_probs(model, test_ds, tta_tfs, use_amp=USE_AMP)
+    tta_preds = tta_probs.argmax(axis=1)
+    tta_acc = accuracy_score(tta_labels, tta_preds) * 100
+    tta_f1 = f1_score(tta_labels, tta_preds, average="macro") * 100
+    print(f"   TTA Accuracy : {tta_acc:.4f}%")
+    print(f"   TTA F1 Macro : {tta_f1:.4f}%")
+    eval_probs, eval_labels, eval_preds = tta_probs, tta_labels, tta_preds
+    eval_tag = f"TTA ×{len(tta_tfs)}"
+else:
+    eval_probs, eval_labels, eval_preds = std_probs, std_labels, std_preds
+    eval_tag = "Standard test"
 
-# Confusion matrix (TTA only — primary test view)
+per_f1 = f1_score(eval_labels, eval_preds, average=None, zero_division=0) * 100
+
+# Confusion matrix (selected eval mode)
 short_names = [c.replace("___", "\n") for c in class_list]
 fig_cm, ax_cm = plt.subplots(figsize=(14, 12))
-cm = confusion_matrix(tta_labels, tta_preds)
+cm = confusion_matrix(eval_labels, eval_preds)
 cm_pct = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1) * 100
 sns.heatmap(
     cm_pct,
@@ -1139,21 +1169,21 @@ sns.heatmap(
     linewidths=0.2,
     cbar_kws={"label": "% row"},
 )
-ax_cm.set_title(f"Confusion matrix (TTA ×{len(tta_tfs)})", fontweight="bold", fontsize=12)
+ax_cm.set_title(f"Confusion matrix ({eval_tag})", fontweight="bold", fontsize=12)
 ax_cm.set_ylabel("True")
 ax_cm.set_xlabel("Predicted")
 ax_cm.tick_params(axis="both", labelsize=6)
 plt.tight_layout()
-print("\n▶ Figure (eval): confusion_matrix_tta")
-save_fig_notebook(fig_cm, FIG_DIR / "confusion_matrix_tta.png", dpi=100)
+print("\n▶ Figure (eval): confusion_matrix_eval")
+save_fig_notebook(fig_cm, FIG_DIR / "confusion_matrix_eval.png", dpi=100)
 
 # Multiclass ROC (one-vs-rest): macro + micro (readable for many classes)
-y_bin = label_binarize(tta_labels, classes=np.arange(NUM_CLASSES))
-fpr_m, tpr_m, _ = roc_curve(y_bin.ravel(), tta_probs.ravel())
+y_bin = label_binarize(eval_labels, classes=np.arange(NUM_CLASSES))
+fpr_m, tpr_m, _ = roc_curve(y_bin.ravel(), eval_probs.ravel())
 auc_micro = auc(fpr_m, tpr_m)
 fpr_i, tpr_i, roc_auc_i = {}, {}, {}
 for i in range(NUM_CLASSES):
-    fpr_i[i], tpr_i[i], _ = roc_curve(y_bin[:, i], tta_probs[:, i])
+    fpr_i[i], tpr_i[i], _ = roc_curve(y_bin[:, i], eval_probs[:, i])
     roc_auc_i[i] = auc(fpr_i[i], tpr_i[i])
 all_fpr = np.unique(np.concatenate([fpr_i[i] for i in range(NUM_CLASSES)]))
 mean_tpr = np.zeros_like(all_fpr, dtype=float)
@@ -1163,35 +1193,106 @@ mean_tpr /= NUM_CLASSES
 auc_macro = auc(all_fpr, mean_tpr)
 
 fig_roc, ax_r = plt.subplots(figsize=(8, 7))
-ax_r.plot(fpr_m, tpr_m, lw=2, label=f"Micro-average ROC (AUC = {auc_micro:.4f})")
-ax_r.plot(all_fpr, mean_tpr, lw=2, linestyle="--", label=f"Macro-average ROC (AUC = {auc_macro:.4f})")
+# Plot all per-class ROC curves (thin) + averages (dotted, bold).
+for i in range(NUM_CLASSES):
+    ax_r.plot(fpr_i[i], tpr_i[i], color="#5dade2", lw=0.9, alpha=0.25)
+ax_r.plot(
+    fpr_m, tpr_m, color="#e74c3c", lw=2.6, linestyle=":",
+    label=f"Micro-average (dotted) AUC = {auc_micro:.4f}"
+)
+ax_r.plot(
+    all_fpr, mean_tpr, color="#2e86c1", lw=2.6, linestyle=":",
+    label=f"Macro-average (dotted) AUC = {auc_macro:.4f}"
+)
 ax_r.plot([0, 1], [0, 1], "k:", lw=1, alpha=0.5)
 ax_r.set_xlim([0.0, 1.0])
 ax_r.set_ylim([0.0, 1.05])
 ax_r.set_xlabel("False positive rate")
 ax_r.set_ylabel("True positive rate")
-ax_r.set_title("Multiclass ROC (OvR) — TTA probabilities", fontweight="bold")
+ax_r.set_title(f"Class-wise ROC + dotted averages — {eval_tag}", fontweight="bold")
 ax_r.legend(loc="lower right")
 ax_r.grid(alpha=0.3)
 plt.tight_layout()
-print("\n▶ Figure (eval): roc_multiclass_tta")
-save_fig_notebook(fig_roc, FIG_DIR / "roc_multiclass_tta.png", dpi=120)
+print("\n▶ Figure (eval): roc_multiclass_eval")
+save_fig_notebook(fig_roc, FIG_DIR / "roc_multiclass_eval.png", dpi=120)
+
+# Prediction confidence distribution (M3-style score visualization)
+eval_conf = eval_probs.max(axis=1)
+is_correct = (eval_preds == eval_labels)
+fig_conf, ax_conf = plt.subplots(figsize=(10, 5))
+ax_conf.hist(eval_conf[is_correct], bins=25, alpha=0.7, color="#27ae60", label="Correct")
+if np.any(~is_correct):
+    ax_conf.hist(eval_conf[~is_correct], bins=25, alpha=0.7, color="#e74c3c", label="Wrong")
+ax_conf.axvline(0.5, color="k", linestyle="--", lw=1.5, label="0.5 reference")
+ax_conf.set_title(f"Prediction Confidence Distribution ({eval_tag})", fontweight="bold")
+ax_conf.set_xlabel("Max softmax probability")
+ax_conf.set_ylabel("Number of samples")
+ax_conf.grid(alpha=0.3)
+ax_conf.legend()
+plt.tight_layout()
+print("▶ Figure (eval): confidence_distribution")
+save_fig_notebook(fig_conf, FIG_DIR / "confidence_distribution.png", dpi=120)
+
+# Robustness under Gaussian noise (M3-style robustness figure)
+@torch.no_grad()
+def eval_with_noise(model, loader, sigma, use_amp=False):
+    model.eval()
+    preds_all, labels_all = [], []
+    for imgs, labels in tqdm(loader, desc=f"Noise σ={sigma:.2f}", leave=False):
+        imgs = imgs.to(DEVICE, non_blocking=True)
+        labels = labels.to(DEVICE, non_blocking=True)
+        if sigma > 0:
+            imgs = torch.clamp(imgs + torch.randn_like(imgs) * sigma, -3.0, 3.0)
+        with autocast(enabled=use_amp):
+            out = model(imgs)
+        preds_all.extend(out.argmax(1).cpu().numpy())
+        labels_all.extend(labels.cpu().numpy())
+    acc_n = accuracy_score(labels_all, preds_all) * 100
+    f1_n = f1_score(labels_all, preds_all, average="macro", zero_division=0) * 100
+    return acc_n, f1_n
+
+print("\n🛡️ Robustness evaluation (Gaussian noise)")
+noise_levels = [0.0, 0.03, 0.06, 0.10, 0.15]
+rob_accs, rob_f1s = [], []
+for sigma in noise_levels:
+    acc_n, f1_n = eval_with_noise(model, test_loader, sigma, use_amp=USE_AMP)
+    rob_accs.append(acc_n)
+    rob_f1s.append(f1_n)
+    print(f"   σ={sigma:.2f} | Acc={acc_n:.3f}% | F1={f1_n:.3f}%")
+
+fig_rob, axes_rob = plt.subplots(1, 2, figsize=(12, 5))
+axes_rob[0].plot(noise_levels, rob_accs, 'o-', color="#e67e22", lw=2, ms=6)
+axes_rob[0].set_title("Robustness — Accuracy vs Noise", fontweight="bold")
+axes_rob[0].set_xlabel("Gaussian noise σ")
+axes_rob[0].set_ylabel("Accuracy (%)")
+axes_rob[0].grid(alpha=0.3)
+
+axes_rob[1].plot(noise_levels, rob_f1s, 's-', color="#8e44ad", lw=2, ms=6)
+axes_rob[1].set_title("Robustness — Macro F1 vs Noise", fontweight="bold")
+axes_rob[1].set_xlabel("Gaussian noise σ")
+axes_rob[1].set_ylabel("F1 Macro (%)")
+axes_rob[1].grid(alpha=0.3)
+plt.tight_layout()
+print("▶ Figure (eval): robustness_noise")
+save_fig_notebook(fig_rob, FIG_DIR / "robustness_noise_eval.png", dpi=120)
 
 print("\n" + "═" * 72)
-print("📊  OmniCrops — SwinV2-B+FPN | test summary (std vs TTA)")
+print("📊  OmniCrops — SwinV2-B+FPN | test summary")
 print("═" * 72)
-print(f"  Classes: {NUM_CLASSES} | Best epoch: {stopper.best_ep} | TTA: ×{len(tta_tfs)}")
-print(f"  {'':22} {'Standard':>12} {'TTA':>12}")
+print(f"  Classes: {NUM_CLASSES} | Best epoch: {stopper.best_ep} | Eval mode: {eval_tag}")
+print(f"  {'':22} {'Standard':>12} {'Selected':>12}")
 print("  " + "─" * 48)
-print(f"  {'Accuracy %':<22} {std_acc:>11.4f} {tta_acc:>12.4f}")
-print(f"  {'F1 macro %':<22} {std_f1:>11.4f} {tta_f1:>12.4f}")
+print(f"  {'Accuracy %':<22} {std_acc:>11.4f} {accuracy_score(eval_labels, eval_preds) * 100:>12.4f}")
+print(f"  {'F1 macro %':<22} {std_f1:>11.4f} {f1_score(eval_labels, eval_preds, average='macro') * 100:>12.4f}")
+if USE_TTA:
+    print(f"  {'TTA gain (F1)':<22} {0.0:>11.4f} {(tta_f1 - std_f1):>12.4f}")
 print(f"  ROC AUC (micro/macro): {auc_micro:.4f} / {auc_macro:.4f}")
 print("─" * 72)
 print(
-    f"  Per-class F1 (TTA)  mean {per_f1.mean():.2f}% | "
+    f"  Per-class F1 ({eval_tag})  mean {per_f1.mean():.2f}% | "
     f"min {per_f1.min():.2f}% | max {per_f1.max():.2f}%"
 )
-print("\n" + classification_report(tta_labels, tta_preds, target_names=class_list, digits=4, zero_division=0))
+print("\n" + classification_report(eval_labels, eval_preds, target_names=class_list, digits=4, zero_division=0))
 print("═" * 72)
 print(f"✅ Model: {SAVE_PATH}")
 print(f"✅ Figures: {FIG_DIR} ({len(list(FIG_DIR.glob('*.png')))} PNG)")
