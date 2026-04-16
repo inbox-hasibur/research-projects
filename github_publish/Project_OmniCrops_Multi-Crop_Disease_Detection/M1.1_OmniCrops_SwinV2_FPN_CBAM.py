@@ -1,7 +1,7 @@
 # OmniCrops: A Vision Transformer Based Robust Multi-Crop Disease Detection in Real-World Agricultural Environments
 
 # =============================================================================
-# OmniCrops: combine 3 sources → balanced dataset → SwinV2-B+FPN → test + metrics
+# OmniCrops: combine 3 sources → balanced dataset → SwinV2-B+FPN+CBAM → test + metrics
 # Flow: A) build dataset  B) train  C) TTA test, confusion matrix, ROC, report
 # =============================================================================
 
@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from torchvision.models import swin_v2_b, Swin_V2_B_Weights
 
@@ -712,11 +712,11 @@ EPOCHS_STAGE1 = int(os.environ.get("OMNICROPS_STAGE1_EPOCHS", "40"))
 EPOCHS_STAGE2 = int(os.environ.get("OMNICROPS_STAGE2_EPOCHS", "10"))
 EPOCHS        = EPOCHS_STAGE1 + EPOCHS_STAGE2
 _effective_batch = BATCH_SIZE * ACCUM_STEPS
-_bs_scale = max(1.0, _effective_batch / 256.0)
-LR_BACKBONE   = float(os.environ.get("OMNICROPS_LR_BACKBONE", str(1.0e-5 * _bs_scale)))
-LR_FPN        = float(os.environ.get("OMNICROPS_LR_FPN", str(8.0e-5 * _bs_scale)))
-LR_HEAD       = float(os.environ.get("OMNICROPS_LR_HEAD", str(4.0e-4 * _bs_scale)))
-WARMUP_EP     = 3
+_bs_scale = max(0.75, _effective_batch / 512.0)
+LR_BACKBONE   = float(os.environ.get("OMNICROPS_LR_BACKBONE", str(2.0e-6 * _bs_scale)))
+LR_FPN        = float(os.environ.get("OMNICROPS_LR_FPN", str(2.0e-5 * _bs_scale)))
+LR_HEAD       = float(os.environ.get("OMNICROPS_LR_HEAD", str(8.0e-5 * _bs_scale)))
+WARMUP_EP     = int(os.environ.get("OMNICROPS_WARMUP_EPOCHS", "8"))
 PATIENCE      = int(os.environ.get("OMNICROPS_PATIENCE", "8"))
 LABEL_SMOOTH  = float(os.environ.get("OMNICROPS_LABEL_SMOOTH", "0.02"))
 MIXUP_ALPHA   = float(os.environ.get("OMNICROPS_MIXUP_ALPHA", "0.15"))
@@ -724,7 +724,7 @@ CUTMIX_ALPHA  = float(os.environ.get("OMNICROPS_CUTMIX_ALPHA", "0.8"))
 DROPOUT_HEAD  = float(os.environ.get("OMNICROPS_DROPOUT_HEAD", "0.2"))
 WEIGHT_DECAY  = 1e-4
 SEED          = 42
-SAVE_PATH     = str(OUT_ROOT / "best_omnicrops_swinv2.pth")
+SAVE_PATH     = str(OUT_ROOT / "best_omnicrops_swinv2_fpn_cbam.pth")
 USE_TTA = os.environ.get("OMNICROPS_USE_TTA", "1").lower() in ("1", "true", "yes")
 
 if HIGH_F1_PRESET:
@@ -742,6 +742,8 @@ IMG_SIZE_STAGE1 = int(os.environ.get("OMNICROPS_TRAIN_SIZE_STAGE1", "224"))
 IMG_SIZE_STAGE2 = int(os.environ.get("OMNICROPS_TRAIN_SIZE_STAGE2", "320"))
 EMA_DECAY = float(os.environ.get("OMNICROPS_EMA_DECAY", "0.9995"))
 USE_EMA = os.environ.get("OMNICROPS_USE_EMA", "1").lower() in ("1", "true", "yes")
+GRAD_CLIP_NORM = float(os.environ.get("OMNICROPS_GRAD_CLIP_NORM", "0.7"))
+MIX_START_EPOCH = int(os.environ.get("OMNICROPS_MIX_START_EPOCH", str(WARMUP_EP + 2)))
 
 torch.manual_seed(SEED)
 if DEVICE.type == "cuda":
@@ -763,6 +765,7 @@ print(f"   Effective batch target: {EFFECTIVE_BATCH_TARGET} | Accum steps: {ACCU
 print(f"   AMP     : {'ON (fp16/bf16 mix — faster)' if USE_AMP else 'OFF'}")
 print(f"   High-F1 preset: {'ON' if HIGH_F1_PRESET else 'OFF'} | mixup_prob={MIXUP_PROB:.2f} cutmix_prob={CUTMIX_PROB:.2f}")
 print(f"   Progressive resize: {IMG_SIZE_STAGE1} → {IMG_SIZE_STAGE2} | EMA: {'ON' if USE_EMA else 'OFF'} (decay={EMA_DECAY})")
+print(f"   Stabilizers: warmup={WARMUP_EP}ep | mix_start={MIX_START_EPOCH} | grad_clip={GRAD_CLIP_NORM}")
 if GPU_COUNT > 1 and os.environ.get("OMNICROPS_USE_DDP", "0").lower() not in ("1", "true", "yes"):
     print(f"   ⚠️  {GPU_COUNT} GPUs detected, but single-process training is active (no DDP).")
 if DEVICE.type == "cuda" and BATCH_SIZE > 64:
@@ -846,14 +849,39 @@ class OmniCropsDataset(Dataset):
             img = Image.new("RGB", (224, 224), 0)
         return self.tf(img), label
 
+
+def _is_rice_class(class_name: str) -> bool:
+    return class_name.startswith("Rice___")
+
+
+def build_domain_balanced_sampler(dataset: OmniCropsDataset):
+    """
+    Balanced sampling by class + domain emphasis.
+    Domain shift fix: Rice receives extra sampling pressure.
+    """
+    labels = np.array([label for _, label in dataset.samples], dtype=np.int64)
+    if labels.size == 0:
+        return None
+    class_counts = np.bincount(labels, minlength=len(dataset.classes)).astype(np.float64)
+    class_inv = 1.0 / np.maximum(class_counts, 1.0)
+    domain_boost = np.ones(len(dataset.classes), dtype=np.float64)
+    for cls_name, cls_idx in dataset.cls2idx.items():
+        if _is_rice_class(cls_name):
+            domain_boost[cls_idx] = 2.0
+    sample_weights = class_inv[labels] * domain_boost[labels]
+    sample_weights = sample_weights / np.mean(sample_weights)
+    sample_weights_t = torch.tensor(sample_weights, dtype=torch.double)
+    return WeightedRandomSampler(sample_weights_t, num_samples=len(sample_weights_t), replacement=True)
+
 def build_dataloaders(train_size: int, eval_size: int, no_mix_phase: bool = False):
     train_tf_local, val_tf_local, tta_tfs_local = build_transforms(train_size, eval_size, no_mix_phase=no_mix_phase)
     train_ds_local = OmniCropsDataset(OUT_ROOT/"train", class_list, train_tf_local)
     val_ds_local = OmniCropsDataset(OUT_ROOT/"val", class_list, val_tf_local)
     test_ds_local = OmniCropsDataset(OUT_ROOT/"test", class_list, val_tf_local)
     pin_local = DEVICE.type == "cuda"
+    train_sampler = build_domain_balanced_sampler(train_ds_local)
     train_loader_local = DataLoader(
-        train_ds_local, BATCH_SIZE, shuffle=True,
+        train_ds_local, BATCH_SIZE, shuffle=False, sampler=train_sampler,
         num_workers=NUM_WORKERS, pin_memory=pin_local, drop_last=True,
         persistent_workers=NUM_WORKERS > 0,
     )
@@ -898,45 +926,93 @@ print(f"   Expect ~{max(1, _n_bt // 2)}–{_n_bt * 2} s for first epoch wall-clo
 print(f"   Class weight range (train): {cls_wt.min():.3f} .. {cls_wt.max():.3f}")
 
 
-# Model: SwinV2-B backbone + FPN head
+# Model: SwinV2-B backbone + FPN + CBAM head
+class ChannelAttention(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(8, channels // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        attn = self.mlp(self.avg_pool(x)) + self.mlp(self.max_pool(x))
+        return x * self.sigmoid(attn)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        padding = (kernel_size - 1) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        attn = torch.cat([avg_out, max_out], dim=1)
+        return x * self.sigmoid(self.conv(attn))
+
+
+class CBAMBlock(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16, spatial_kernel: int = 7):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction=reduction)
+        self.sa = SpatialAttention(kernel_size=spatial_kernel)
+
+    def forward(self, x):
+        x = self.ca(x)
+        x = self.sa(x)
+        return x
+
+
 class FPNFusion(nn.Module):
     """
-    Lightweight FPN that fuses SwinV2-B stage outputs.
-    SwinV2-B feature dims: S1=128, S2=256, S3=512, S4=1024
+    Spatial FPN for SwinV2-B stage outputs.
+    SwinV2-B feature dims: S2=256, S3=512, S4=1024
     Output: fused 512-d global descriptor
     """
     def __init__(self):
         super().__init__()
-        # Lateral projections → common 256-d
-        self.lat4 = nn.Sequential(nn.Linear(1024, 256), nn.GELU())
-        self.lat3 = nn.Sequential(nn.Linear(512,  256), nn.GELU())
-        self.lat2 = nn.Sequential(nn.Linear(256,  256), nn.GELU())
+        self.lat4 = nn.Conv2d(1024, 256, kernel_size=1)
+        self.lat3 = nn.Conv2d(512, 256, kernel_size=1)
+        self.lat2 = nn.Conv2d(256, 256, kernel_size=1)
 
-        # Top-down fusion refinement
-        self.fuse43 = nn.Sequential(nn.Linear(256, 256), nn.GELU())
-        self.fuse32 = nn.Sequential(nn.Linear(256, 256), nn.GELU())
-
-        # Final aggregation: [p4‖p3‖p2] → 512
+        self.smooth3 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.smooth2 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
         self.agg = nn.Sequential(
             nn.Linear(768, 512), nn.GELU(),
             nn.Dropout(0.1))
 
     def forward(self, f2, f3, f4):
-        # f2: (B, H2*W2, 256)  f3: (B, H3*W3, 512)  f4: (B, H4*W4, 1024)
-        p4 = self.lat4(f4.mean(1))   # (B, 256) — global avg over tokens
-        p3 = self.lat3(f3.mean(1))   # (B, 256)
-        p2 = self.lat2(f2.mean(1))   # (B, 256)
+        # f2: (B, 256, 28, 28), f3: (B, 512, 14, 14), f4: (B, 1024, 7, 7)
+        p4 = self.lat4(f4)
+        p3 = self.lat3(f3) + F.interpolate(p4, size=f3.shape[-2:], mode="bilinear", align_corners=False)
+        p3 = self.smooth3(p3)
+        p2 = self.lat2(f2) + F.interpolate(p3, size=f2.shape[-2:], mode="bilinear", align_corners=False)
+        p2 = self.smooth2(p2)
 
-        # Top-down fusion
-        p3 = self.fuse43(p3 + p4)
-        p2 = self.fuse32(p2 + p3)
+        p4g = self.pool(p4).flatten(1)
+        p3g = self.pool(p3).flatten(1)
+        p2g = self.pool(p2).flatten(1)
+        return self.agg(torch.cat([p4g, p3g, p2g], dim=1))  # (B, 512)
 
-        return self.agg(torch.cat([p4, p3, p2], dim=1))  # (B, 512)
 
-
-class OmniCropsSwinFPN(nn.Module):
+class OmniCropsSwinFPNCBAM(nn.Module):
     """
-    SwinV2-B backbone + FPN multi-scale fusion + classification head.
+    SwinV2-B backbone + CBAM + FPN multi-scale fusion + classification head.
 
     Architecture:
       Input(224×224×3)
@@ -945,6 +1021,7 @@ class OmniCropsSwinFPN(nn.Module):
             Stage2 → 28×28, 256-d   ← FPN P2
             Stage3 → 14×14, 512-d   ← FPN P3
             Stage4 →  7×7,  1024-d  ← FPN P4
+        → CBAM on P2/P3/P4
         → FPN fusion → 512-d
         → Head: FC(512→256)→GELU→Drop→FC(256→N)
     """
@@ -966,7 +1043,11 @@ class OmniCropsSwinFPN(nn.Module):
         self.stage4      = backbone.features[7]   # 1024-d ← P4
         self.norm        = backbone.norm
 
-        self.fpn  = FPNFusion()
+        self.cbam2 = CBAMBlock(256, reduction=16, spatial_kernel=7)
+        self.cbam3 = CBAMBlock(512, reduction=16, spatial_kernel=7)
+        self.cbam4 = CBAMBlock(1024, reduction=16, spatial_kernel=7)
+
+        self.fpn = FPNFusion()
         self.head = nn.Sequential(
             nn.Linear(512, 256), nn.GELU(),
             nn.Dropout(dropout),
@@ -975,7 +1056,7 @@ class OmniCropsSwinFPN(nn.Module):
         self._init_head()
 
     def _init_head(self):
-        for m in [self.fpn, self.head]:
+        for m in [self.cbam2, self.cbam3, self.cbam4, self.fpn, self.head]:
             for layer in m.modules():
                 if isinstance(layer, nn.Linear):
                     nn.init.trunc_normal_(layer.weight, std=0.02)
@@ -992,12 +1073,12 @@ class OmniCropsSwinFPN(nn.Module):
         x  = self.downsample3(f3)  # (B,  7,  7, 1024)
         f4 = self.stage4(x)        # (B,  7,  7, 1024) ← P4
 
-        # Flatten spatial → token sequence for FPN
-        f2f = f2.flatten(1, 2)   # (B, 784,  256)
-        f3f = f3.flatten(1, 2)   # (B, 196,  512)
-        f4f = f4.flatten(1, 2)   # (B,  49, 1024)
+        # Keep spatial structure for CBAM and FPN.
+        f2 = self.cbam2(f2.permute(0, 3, 1, 2).contiguous())
+        f3 = self.cbam3(f3.permute(0, 3, 1, 2).contiguous())
+        f4 = self.cbam4(f4.permute(0, 3, 1, 2).contiguous())
 
-        feat = self.fpn(f2f, f3f, f4f)   # (B, 512)
+        feat = self.fpn(f2, f3, f4)   # (B, 512)
         return self.head(feat)            # (B, N_classes)
 
     def get_param_groups(self, lr_bb, lr_fpn, lr_head):
@@ -1013,14 +1094,14 @@ class OmniCropsSwinFPN(nn.Module):
                        list(self.norm.parameters()))
         return [
             {"params": bb_params,              "lr": lr_bb,   "name": "backbone"},
-            {"params": self.fpn.parameters(),  "lr": lr_fpn,  "name": "fpn"},
+            {"params": list(self.cbam2.parameters()) + list(self.cbam3.parameters()) + list(self.cbam4.parameters()) + list(self.fpn.parameters()),  "lr": lr_fpn,  "name": "fpn_cbam"},
             {"params": self.head.parameters(), "lr": lr_head, "name": "head"},
         ]
 
 
-model  = OmniCropsSwinFPN(NUM_CLASSES).to(DEVICE)
+model  = OmniCropsSwinFPNCBAM(NUM_CLASSES).to(DEVICE)
 params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"📐 OmniCrops-SwinV2+FPN | Parameters: {params:,}")
+print(f"📐 OmniCrops-SwinV2+FPN+CBAM | Parameters: {params:,}")
 
 # Smoke test
 with torch.no_grad():
@@ -1071,9 +1152,12 @@ optimizer    = optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY,
                            betas=(0.9, 0.999))
 
 def warmup_cosine(ep, warmup=WARMUP_EP, total=EPOCHS_STAGE1):
-    if ep < warmup: return (ep + 1) / warmup
+    if ep < warmup:
+        # Slower warmup to avoid early LR spikes.
+        return 0.05 + 0.95 * ((ep + 1) / max(1, warmup))
     p = (ep - warmup) / max(1, total - warmup)
-    return 0.5 * (1 + np.cos(np.pi * p))
+    floor = 0.12
+    return floor + (1.0 - floor) * 0.5 * (1 + np.cos(np.pi * p))
 
 scheduler = optim.lr_scheduler.LambdaLR(
     optimizer, lr_lambda=lambda e: warmup_cosine(e))
@@ -1163,14 +1247,16 @@ def train_epoch(model, loader, crit, opt, epoch, scaler, use_amp, mixup_prob, cu
         labels = labels.to(DEVICE, non_blocking=True)
         bs = imgs.size(0)
         r = np.random.rand()
+        mix_active = epoch >= MIX_START_EPOCH
+        ramp = min(1.0, max(0.0, (epoch - MIX_START_EPOCH + 1) / 4.0)) if mix_active else 0.0
 
         with autocast(enabled=use_amp):
-            if r < mixup_prob and epoch > WARMUP_EP:
+            if mix_active and r < (mixup_prob * ramp):
                 imgs_m, ya, yb, lam = mixup(imgs, labels)
                 out = model(imgs_m)
                 loss = mixed_loss(crit, out, ya, yb, lam)
                 is_mixed = True
-            elif r < (mixup_prob + cutmix_prob) and epoch > WARMUP_EP:
+            elif mix_active and r < ((mixup_prob + cutmix_prob) * ramp):
                 imgs_m, ya, yb, lam = cutmix(imgs, labels)
                 out = model(imgs_m)
                 loss = mixed_loss(crit, out, ya, yb, lam)
@@ -1180,6 +1266,10 @@ def train_epoch(model, loader, crit, opt, epoch, scaler, use_amp, mixup_prob, cu
                 loss = crit(out, labels)
                 is_mixed = False
 
+        if not torch.isfinite(loss):
+            opt.zero_grad(set_to_none=True)
+            continue
+
         loss = loss / ACCUM_STEPS
         do_step = ((batch_i + 1) % ACCUM_STEPS == 0) or ((batch_i + 1) == len(loader))
 
@@ -1187,7 +1277,7 @@ def train_epoch(model, loader, crit, opt, epoch, scaler, use_amp, mixup_prob, cu
             scaler.scale(loss).backward()
             if do_step:
                 scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                 if DEVICE.type == "xla" and xm is not None:
                     scaler.step(opt)
                     xm.mark_step()
@@ -1200,7 +1290,7 @@ def train_epoch(model, loader, crit, opt, epoch, scaler, use_amp, mixup_prob, cu
         else:
             loss.backward()
             if do_step:
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                 if DEVICE.type == "xla" and xm is not None:
                     xm.optimizer_step(opt, barrier=True)
                 else:
@@ -1260,7 +1350,7 @@ def collect_probs_loader(model, loader, use_amp=False):
 # Training loop
 history = {'tl': [], 'ta': [], 'vl': [], 'va': [], 'vf1': [], 'lr_head': []}
 
-print("🔥 Training OmniCrops-SwinV2+FPN")
+print("🔥 Training OmniCrops-SwinV2+FPN+CBAM")
 print(f"   Device:{DEVICE} | Classes:{NUM_CLASSES} | Patience:{PATIENCE}")
 print(f"   Mixup:{MIXUP_ALPHA} | CutMix:{CUTMIX_ALPHA} | LabelSmooth:{LABEL_SMOOTH} -> fine-tune:{FINETUNE_LABEL_SMOOTH}")
 print("─" * 95)
@@ -1356,7 +1446,7 @@ axes[2].axvline(stopper.best_ep, color='green', ls='--')
 axes[2].set_title("F1-Score (Macro) ↑", fontweight='bold'); axes[2].legend()
 axes[2].grid(alpha=0.4)
 
-plt.suptitle("OmniCrops-SwinV2+FPN Training Curves", fontsize=14, fontweight='bold')
+plt.suptitle("OmniCrops-SwinV2+FPN+CBAM Training Curves", fontsize=14, fontweight='bold')
 plt.tight_layout()
 print("\n▶ Figure (train): training_curves — loss / acc / val F1")
 save_fig_notebook(fig, FIG_DIR / "training_curves.png", dpi=120)
@@ -1584,7 +1674,7 @@ if len(test_ds.samples) > 0:
     save_fig_notebook(fig_xai, FIG_DIR / "xai_saliency_grid.png", dpi=120)
 
 print("\n" + "═" * 72)
-print("📊  OmniCrops — SwinV2-B+FPN | test summary")
+print("📊  OmniCrops — SwinV2-B+FPN+CBAM | test summary")
 print("═" * 72)
 print(f"  Classes: {NUM_CLASSES} | Best epoch: {stopper.best_ep} | Eval mode: {eval_tag}")
 print(f"  {'':22} {'Standard':>12} {'Selected':>12}")
