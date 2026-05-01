@@ -52,20 +52,20 @@ def discover_project_dirs() -> list[Path]:
     for p in sorted(REPO_ROOT.iterdir()):
         if not p.is_dir():
             continue
-        if not p.name.startswith("Project_"):
-            continue
-        if p.name == "github_publish" or p.name == "tools":
+        if p.name in (".git", "github_publish", "tools", "__pycache__"):
             continue
         out.append(p)
     return out
 
 
-def iter_py_files(project_dir: Path) -> list[Path]:
+def iter_files(project_dir: Path) -> list[Path]:
     files: list[Path] = []
-    for f in project_dir.rglob("*.py"):
-        if _should_skip(f):
-            continue
-        files.append(f)
+    extensions = ("*.py", "*.tex", "*.bib", "*.png", "*.jpg", "*.pdf", "*.md", "*.docx")
+    for ext in extensions:
+        for f in project_dir.rglob(ext):
+            if _should_skip(f):
+                continue
+            files.append(f)
     return sorted(files)
 
 
@@ -80,7 +80,7 @@ def main() -> int:
         rel_proj = proj.relative_to(REPO_ROOT)
         dst_base = PUBLISH_ROOT / rel_proj
         dst_base.mkdir(parents=True, exist_ok=True)
-        for src in iter_py_files(proj):
+        for src in iter_files(proj):
             rel = src.relative_to(proj)
             dst = dst_base / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -89,7 +89,7 @@ def main() -> int:
             print(f"OK  {dst.relative_to(REPO_ROOT)}")
 
     print("-" * 60)
-    print(f"Synced {copied} .py file(s) from {len(projects)} project folder(s) -> {PUBLISH_ROOT.name}/")
+    print(f"Synced {copied} file(s) from {len(projects)} project folder(s) -> {PUBLISH_ROOT.name}/")
     return 0
 
 

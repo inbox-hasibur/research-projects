@@ -229,22 +229,7 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 return True       # stop!
             return False
-     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 121.7/121.7 kB 3.4 MB/s eta 0:00:00
-  Installing build dependencies ... done
-  Getting requirements to build wheel ... done
-  Preparing metadata (pyproject.toml) ... done
-  Installing build dependencies ... done
-  Getting requirements to build wheel ... done
-  Preparing metadata (pyproject.toml) ... done
-  Building wheel for mamba-ssm (pyproject.toml) ... done
-  Building wheel for causal-conv1d (pyproject.toml) ... done
-     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7.8/7.8 MB 51.4 MB/s eta 0:00:00
-  Installing build dependencies ... done
-  Getting requirements to build wheel ... done
-  Preparing metadata (pyproject.toml) ... done
-  Building wheel for grad-cam (pyproject.toml) ... done
-⚠️ mamba-ssm not found — using PyTorch SSM fallback
-🚀 Device: cuda
+
 # ============================================================
 # 9 Training & Eval Functions
 # ============================================================
