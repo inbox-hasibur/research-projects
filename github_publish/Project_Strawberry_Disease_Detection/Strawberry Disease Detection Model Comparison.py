@@ -28,7 +28,7 @@ matplotlib.rcParams.update({
     'xtick.labelsize'  : 9,
     'ytick.labelsize'  : 9,
     'figure.dpi'       : 150,
-    'savefig.dpi'      : 300,          # IEEE print quality
+    'savefig.dpi'      : 300,
     'savefig.bbox'     : 'tight',
     'axes.spines.top'  : False,
     'axes.spines.right': False,
@@ -44,13 +44,28 @@ from sklearn.preprocessing import label_binarize
 import timm
 warnings.filterwarnings('ignore')
 
-# ── Colour palette (IEEE-safe, colourblind-friendly) ─────────
+# ── helper: safe figure save + close ─────────────────────────
+def save_fig(fname, title=""):
+    """Save current figure as PDF+PNG then close it cleanly."""
+    plt.savefig(f"{fname}.pdf", bbox_inches='tight')
+    plt.savefig(f"{fname}.png", bbox_inches='tight')
+    plt.show()
+    plt.close('all')
+    print(f"✅ {title or fname} saved")
+
+# ── helper: safe ylim (handles NaN / Inf) ────────────────────
+def safe_ylim(ax, vals, pad_lo=0.97, pad_hi=1.02):
+    finite = [v for v in vals if np.isfinite(v)]
+    if len(finite) >= 2:
+        ax.set_ylim([min(finite) * pad_lo, max(finite) * pad_hi])
+
+# ── Colour palette ────────────────────────────────────────────
 PAL = {
-    'vgg'  : '#2166ac',   # blue
-    'res'  : '#d6604d',   # red-orange
-    'eff'  : '#4dac26',   # green
-    'swin' : '#f4a582',   # light orange
-    'ours' : '#1a1a2e',   # near-black
+    'vgg'  : '#2166ac',
+    'res'  : '#d6604d',
+    'eff'  : '#4dac26',
+    'swin' : '#f4a582',
+    'ours' : '#1a1a2e',
     'pos'  : '#2ecc71',
     'neg'  : '#e74c3c',
 }
@@ -128,13 +143,16 @@ def load_annotation_bbox(json_path):
                     ax.extend(s.get('all_points_x', []))
                     ay.extend(s.get('all_points_y', []))
                 elif t == 'rect':
-                    x,y,w,h = s.get('x',0),s.get('y',0),s.get('width',0),s.get('height',0)
+                    x,y,w,h = (s.get('x',0), s.get('y',0),
+                                s.get('width',0), s.get('height',0))
                     ax += [x, x+w]; ay += [y, y+h]
                 elif t == 'ellipse':
-                    cx,cy,rx,ry = s.get('cx',0),s.get('cy',0),s.get('rx',0),s.get('ry',0)
+                    cx,cy,rx,ry = (s.get('cx',0), s.get('cy',0),
+                                   s.get('rx',0), s.get('ry',0))
                     ax += [cx-rx, cx+rx]; ay += [cy-ry, cy+ry]
         return (min(ax), min(ay), max(ax), max(ay)) if ax else None
-    except Exception: return None
+    except Exception:
+        return None
 
 def annotation_crop(img, bbox, padding=0.20):
     if bbox is None: return img
@@ -145,11 +163,12 @@ def annotation_crop(img, bbox, padding=0.20):
     px,py = int(bw*padding), int(bh*padding)
     x1,y1 = max(0,x1-px), max(0,y1-py)
     x2,y2 = min(w,x2+px), min(h,y2+py)
-    return img.crop((x1,y1,x2,y2)) if (x2-x1)>=10 and (y2-y1)>=10 else img
+    return (img.crop((x1,y1,x2,y2))
+            if (x2-x1)>=10 and (y2-y1)>=10 else img)
 
 
 # ============================================================
-# STEP 3 — Dataset Scanning  (Afzaal + PlantVillage ONLY)
+# STEP 3 — Dataset Scanning
 # ============================================================
 def label_from_filename(fname, label_map):
     base = os.path.splitext(os.path.basename(fname))[0].lower()
@@ -196,7 +215,6 @@ afl_vl_paths,  afl_vl_labels  = scan_afzaal_split(AFZAAL_VAL,   "val")
 afl_te_paths,  afl_te_labels  = scan_afzaal_split(AFZAAL_TEST,  "test")
 pv_paths,      pv_labels      = scan_plantvillage_strawberry()
 
-# ── Split PlantVillage 80/10/10 ───────────────────────────────
 def split_extra(paths, labels, seed=42):
     if len(paths) == 0:
         return [],[],[],[],[],[]
@@ -208,19 +226,32 @@ def split_extra(paths, labels, seed=42):
 
 pv_tr,pv_vl,pv_te,pv_ytr,pv_yvl,pv_yte = split_extra(pv_paths, pv_labels)
 
-# ── FIXED: mb_ variables completely removed ───────────────────
 train_paths  = afl_tr_paths + pv_tr
 train_labels = afl_tr_labels + pv_ytr
 val_paths    = afl_vl_paths + pv_vl
 val_labels   = afl_vl_labels + pv_yvl
-test_paths   = afl_te_paths          # Afzaal test ONLY — pure benchmark
-test_labels  = afl_te_labels
+
+# ── FIX: Test set includes PV test split so ALL 8 classes present ──
+# This prevents AUC = NaN from missing classes in test labels
+test_paths   = afl_te_paths  + pv_te
+test_labels  = afl_te_labels + pv_yte
 
 print(f"\n✅ Dataset Summary:")
 print(f"   Train : {len(train_paths):,}")
 print(f"   Val   : {len(val_paths):,}")
-print(f"   Test  : {len(test_paths):,}  (Afzaal-only, pure)")
+print(f"   Test  : {len(test_paths):,}  (Afzaal + PV, all 8 classes)")
 print(f"   Total : {len(train_paths)+len(val_paths)+len(test_paths):,}")
+
+# Verify all 8 classes in test
+test_cls_present = set(test_labels)
+print(f"\n   Test classes present: "
+      f"{[IDX_TO_CLASS[i] for i in sorted(test_cls_present)]}")
+missing_cls = set(range(NUM_CLASSES)) - test_cls_present
+if missing_cls:
+    print(f"   ⚠️  Still missing: {[IDX_TO_CLASS[i] for i in missing_cls]}")
+else:
+    print(f"   ✅ All {NUM_CLASSES} classes present in test set")
+
 print(f"\n   Train class distribution:")
 cc = {}
 for l in train_labels: cc[IDX_TO_CLASS[l]] = cc.get(IDX_TO_CLASS[l],0)+1
@@ -245,7 +276,8 @@ train_tf = transforms.Compose([
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
     transforms.RandomRotation(30),
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.08),
+    transforms.ColorJitter(brightness=0.4, contrast=0.4,
+                           saturation=0.3, hue=0.08),
     transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
     transforms.ToTensor(),
     transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
@@ -401,8 +433,8 @@ def train_one_epoch(model, loader, crit, opt):
     model.train(); total=0.0
     for imgs,lbls in loader:
         imgs,lbls = imgs.to(DEVICE), lbls.to(DEVICE)
-        imgs,targets = mixup_data(imgs,lbls,MIXUP_ALPHA) if MIXUP_ALPHA>0 \
-                       else (imgs, lbls)
+        imgs,targets = (mixup_data(imgs,lbls,MIXUP_ALPHA)
+                        if MIXUP_ALPHA>0 else (imgs, lbls))
         opt.zero_grad(set_to_none=True)
         loss = crit(model(imgs), targets)
         loss.backward()
@@ -421,8 +453,8 @@ def evaluate(model, loader, crit):
         probs.extend(F.softmax(logits,-1).cpu().numpy())
         preds.extend(logits.argmax(-1).cpu().numpy())
         gts.extend(lbls.cpu().numpy())
-    return total/len(loader), accuracy_score(gts,preds), \
-           np.array(probs), preds, gts
+    return (total/len(loader), accuracy_score(gts,preds),
+            np.array(probs), preds, gts)
 
 def full_metrics(gts, preds, probs):
     acc  = accuracy_score(gts,preds)
@@ -430,9 +462,27 @@ def full_metrics(gts, preds, probs):
     rec  = recall_score(gts,preds,average='macro',zero_division=0)
     mf1  = f1_score(gts,preds,average='macro',zero_division=0)
     wf1  = f1_score(gts,preds,average='weighted',zero_division=0)
-    try:    auc_s = roc_auc_score(gts,probs,multi_class='ovr',average='macro')
-    except: auc_s = float('nan')
-    return dict(acc=acc,prec=prec,rec=rec,mf1=mf1,wf1=wf1,auc=auc_s)
+    # ── FIX: guard AUC against missing classes ──────────────
+    classes_present = np.unique(gts)
+    if len(classes_present) == NUM_CLASSES:
+        try:
+            auc_s = roc_auc_score(gts, probs,
+                                  multi_class='ovr', average='macro')
+        except Exception:
+            auc_s = float('nan')
+    else:
+        # compute only for present classes
+        try:
+            y_bin = label_binarize(gts, classes=list(range(NUM_CLASSES)))
+            aucs  = []
+            for ci in range(NUM_CLASSES):
+                if ci in classes_present and y_bin[:,ci].sum() > 0:
+                    aucs.append(roc_auc_score(y_bin[:,ci], probs[:,ci]))
+            auc_s = float(np.mean(aucs)) if aucs else float('nan')
+        except Exception:
+            auc_s = float('nan')
+    return dict(acc=acc, prec=prec, rec=rec,
+                mf1=mf1, wf1=wf1, auc=auc_s)
 
 
 # ============================================================
@@ -458,7 +508,8 @@ class ResNet50Model(nn.Module):
     def __init__(self, num_classes=8, drop=0.4):
         super().__init__()
         base = models.resnet50(pretrained=True)
-        self.stem   = nn.Sequential(base.conv1,base.bn1,base.relu,base.maxpool)
+        self.stem   = nn.Sequential(base.conv1,base.bn1,
+                                    base.relu,base.maxpool)
         self.layer1 = base.layer1; self.layer2 = base.layer2
         self.layer3 = base.layer3; self.layer4 = base.layer4
         self.cbam   = CBAM(2048)
@@ -477,13 +528,14 @@ class EfficientNetV2Model(nn.Module):
     def __init__(self, num_classes=8, drop=0.4):
         super().__init__()
         self.backbone = timm.create_model(
-            'tf_efficientnetv2_s', pretrained=True, num_classes=0, global_pool='')
+            'tf_efficientnetv2_s', pretrained=True,
+            num_classes=0, global_pool='')
         EFF_DIM = 1280
         self.eca  = ECA(EFF_DIM)
         self.gem  = GeMPooling(p=3.0)
         self.head = nn.Sequential(
-            nn.Linear(EFF_DIM,512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(drop),
-            nn.Linear(512,num_classes))
+            nn.Linear(EFF_DIM,512), nn.LayerNorm(512), nn.GELU(),
+            nn.Dropout(drop), nn.Linear(512,num_classes))
     def forward(self, x):
         x = self.backbone.forward_features(x)
         x = self.eca(x); x = self.gem(x)
@@ -497,7 +549,8 @@ BENCH_CONFIGS = {
 print("\n📐 Model parameter counts:")
 for name,cls in BENCH_CONFIGS.items():
     m = cls(NUM_CLASSES)
-    print(f"  {name:<32}: {sum(p.numel() for p in m.parameters() if p.requires_grad):>12,}")
+    print(f"  {name:<32}: "
+          f"{sum(p.numel() for p in m.parameters() if p.requires_grad):>12,}")
     del m
 
 
@@ -518,20 +571,28 @@ for bench_name, ModelClass in BENCH_CONFIGS.items():
 
     try:    bb_params = list(model_b.backbone.parameters())
     except AttributeError:
-        try:    bb_params = list(model_b.features.parameters())+list(model_b.cbam.parameters())
-        except: bb_params = (list(model_b.stem.parameters())+list(model_b.layer1.parameters())+
-                             list(model_b.layer2.parameters())+list(model_b.layer3.parameters())+
-                             list(model_b.layer4.parameters()))
+        try:
+            bb_params = (list(model_b.features.parameters()) +
+                         list(model_b.cbam.parameters()))
+        except:
+            bb_params = (list(model_b.stem.parameters()) +
+                         list(model_b.layer1.parameters()) +
+                         list(model_b.layer2.parameters()) +
+                         list(model_b.layer3.parameters()) +
+                         list(model_b.layer4.parameters()))
 
     bb_ids    = {id(p) for p in bb_params}
     new_params = [p for p in model_b.parameters() if id(p) not in bb_ids]
 
-    opt_b = optim.AdamW([{'params':bb_params,'lr':LR*0.1},
-                          {'params':new_params,'lr':LR}],
-                         weight_decay=WEIGHT_DECAY)
-    sch_b = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt_b,T_0=10,T_mult=2)
-    es_b  = EarlyStopping(patience=PATIENCE,
-                          save_path=f"bench_{bench_name.replace('+','_')}.pth")
+    opt_b = optim.AdamW(
+        [{'params':bb_params,'lr':LR*0.1},
+         {'params':new_params,'lr':LR}],
+        weight_decay=WEIGHT_DECAY)
+    sch_b = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        opt_b, T_0=10, T_mult=2)
+    es_b  = EarlyStopping(
+        patience=PATIENCE,
+        save_path=f"bench_{bench_name.replace('+','_')}.pth")
     hist = {'tr_loss':[],'vl_loss':[],'vl_acc':[]}
 
     for ep in range(1, BENCH_EPOCHS+1):
@@ -543,14 +604,17 @@ for bench_name, ModelClass in BENCH_CONFIGS.items():
         hist['vl_loss'].append(vl_l)
         hist['vl_acc'].append(vl_a)
         stop = es_b.step(vl_l, ep, model_b)
-        flag = "🏅" if es_b.counter==0 else f"({es_b.counter}/{PATIENCE})"
+        flag = ("🏅" if es_b.counter==0
+                else f"({es_b.counter}/{PATIENCE})")
         if ep%5==0 or ep==1 or stop:
             print(f"  Ep{ep:02d} | {time.time()-t0:.0f}s | "
-                  f"Tr:{tr_l:.4f} Vl:{vl_l:.4f} Acc:{vl_a*100:.2f}% {flag}")
+                  f"Tr:{tr_l:.4f} Vl:{vl_l:.4f} "
+                  f"Acc:{vl_a*100:.2f}% {flag}")
         if stop:
             print(f"  ⏹ ep{ep} | best ep{es_b.best_epoch}"); break
 
-    model_b.load_state_dict(torch.load(es_b.save_path, map_location=DEVICE))
+    model_b.load_state_dict(
+        torch.load(es_b.save_path, map_location=DEVICE))
     _,_,probs,preds,gts = evaluate(model_b, test_loader, criterion)
     m = full_metrics(gts, preds, probs)
     bench_results[bench_name]   = m
@@ -567,7 +631,7 @@ print(f"\n🏆  WINNER: {winner_name}  (Macro F1={winner_f1:.3f}%)")
 
 
 # ============================================================
-# STEP 10 — Fig 1: Benchmark Comparison (IEEE two-column)
+# STEP 10 — Fig 1: Benchmark Learning Curves  [SEPARATE FIGURE]
 # ============================================================
 BENCH_PAL = {
     "VGG19+CBAM"             : PAL['vgg'],
@@ -575,13 +639,12 @@ BENCH_PAL = {
     "EfficientNetV2+ECA+GeM" : PAL['eff'],
 }
 
-# Fig 1a — Learning curves
 fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 for name, hist in bench_histories.items():
     ep  = range(1, len(hist['tr_loss'])+1)
     col = BENCH_PAL[name]
-    axes[0].plot(ep, hist['tr_loss'], color=col, lw=1.8, label=name)
-    axes[1].plot(ep, hist['vl_loss'], color=col, lw=1.8, label=name)
+    axes[0].plot(ep, hist['tr_loss'],            color=col, lw=1.8, label=name)
+    axes[1].plot(ep, hist['vl_loss'],            color=col, lw=1.8, label=name)
     axes[2].plot(ep, [a*100 for a in hist['vl_acc']], color=col, lw=1.8, label=name)
 
 for ax, title, ylabel in zip(
@@ -595,36 +658,46 @@ for ax, title, ylabel in zip(
 plt.suptitle("Fig. 1 — Benchmark Model Learning Curves",
              fontsize=11, fontweight='bold', y=1.02)
 plt.tight_layout()
-plt.savefig("fig1_benchmark_curves.pdf", bbox_inches='tight')
-plt.savefig("fig1_benchmark_curves.png")
-plt.show(); print("✅ Fig 1 saved")
+save_fig("fig1_benchmark_curves", "Fig 1 — Benchmark Learning Curves")
 
-# Fig 2 — Test metric bar chart
-metrics_keys   = ['acc','mf1','auc']
+
+# ============================================================
+# STEP 10b — Fig 2: Benchmark Metric Bars  [SEPARATE FIGURE]
+# ============================================================
+metrics_keys   = ['acc', 'mf1', 'auc']
 metrics_labels = ['Accuracy (%)', 'Macro F1 (%)', 'Macro AUC-ROC']
+
 fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
 for ax, mk, ml in zip(axes, metrics_keys, metrics_labels):
     names = list(bench_results.keys())
-    vals  = [bench_results[n][mk]*(100 if mk!='auc' else 1) for n in names]
-    cols  = [BENCH_PAL[n] for n in names]
-    bars  = ax.bar(range(len(names)), vals, color=cols, width=0.55,
-                   edgecolor='white', linewidth=0.8)
+    # ── FIX: replace NaN with 0 so bar chart never crashes ──
+    raw_vals = [bench_results[n][mk] for n in names]
+    scale    = 100 if mk != 'auc' else 1
+    vals     = [v * scale if np.isfinite(v) else 0.0 for v in raw_vals]
+    cols     = [BENCH_PAL[n] for n in names]
+
+    bars = ax.bar(range(len(names)), vals, color=cols,
+                  width=0.55, edgecolor='white', linewidth=0.8)
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels([n.replace('+','\n') for n in names], fontsize=8)
-    ax.set_title(f"(a/b/c) Test {ml}", fontweight='bold')
-    ax.set_ylim([min(vals)*0.97, max(vals)*1.02])
-    for bar,val in zip(bars,vals):
-        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.001,
-                f"{val:.2f}", ha='center', va='bottom', fontsize=9,
-                fontweight='bold')
+    ax.set_title(f"Test {ml}", fontweight='bold')
+
+    # ── FIX: use safe_ylim helper ────────────────────────────
+    safe_ylim(ax, vals, pad_lo=0.97, pad_hi=1.02)
+
+    for bar, val, raw in zip(bars, vals, raw_vals):
+        label = (f"{val:.2f}" if np.isfinite(raw)
+                 else "N/A")
+        ax.text(bar.get_x()+bar.get_width()/2,
+                bar.get_height()+0.001,
+                label, ha='center', va='bottom',
+                fontsize=9, fontweight='bold')
     ax.grid(axis='y', alpha=0.3, linestyle='--')
 
 plt.suptitle("Fig. 2 — Benchmark Test Metrics Comparison",
              fontsize=11, fontweight='bold', y=1.02)
 plt.tight_layout()
-plt.savefig("fig2_benchmark_bars.pdf", bbox_inches='tight')
-plt.savefig("fig2_benchmark_bars.png")
-plt.show(); print("✅ Fig 2 saved")
+save_fig("fig2_benchmark_bars", "Fig 2 — Benchmark Metric Bars")
 
 
 # ============================================================
@@ -638,21 +711,26 @@ class CrossAttentionGate(nn.Module):
     def __init__(self, dim=512, heads=8):
         super().__init__()
         self.heads=heads; self.scale=(dim//heads)**-0.5
-        self.q1=nn.Linear(dim,dim,bias=False); self.k2=nn.Linear(dim,dim,bias=False)
-        self.v2=nn.Linear(dim,dim,bias=False); self.q2=nn.Linear(dim,dim,bias=False)
-        self.k1=nn.Linear(dim,dim,bias=False); self.v1=nn.Linear(dim,dim,bias=False)
-        self.out1=nn.Linear(dim,dim,bias=False); self.out2=nn.Linear(dim,dim,bias=False)
-        self.norm1=nn.LayerNorm(dim); self.norm2=nn.LayerNorm(dim)
+        self.q1=nn.Linear(dim,dim,bias=False)
+        self.k2=nn.Linear(dim,dim,bias=False)
+        self.v2=nn.Linear(dim,dim,bias=False)
+        self.q2=nn.Linear(dim,dim,bias=False)
+        self.k1=nn.Linear(dim,dim,bias=False)
+        self.v1=nn.Linear(dim,dim,bias=False)
+        self.out1=nn.Linear(dim,dim,bias=False)
+        self.out2=nn.Linear(dim,dim,bias=False)
+        self.norm1=nn.LayerNorm(dim)
+        self.norm2=nn.LayerNorm(dim)
 
     def forward(self, x1, x2):
         B,D = x1.shape; H,d = self.heads, D//self.heads
-        # x1 → x2
-        q1=self.q1(x1).reshape(B,H,d); k2=self.k2(x2).reshape(B,H,d)
+        q1=self.q1(x1).reshape(B,H,d)
+        k2=self.k2(x2).reshape(B,H,d)
         v2=self.v2(x2).reshape(B,H,d)
         a1=torch.sigmoid((q1*k2*self.scale).sum(-1,keepdim=True))
         x1_r=self.norm1(x1+self.out1((a1*v2).reshape(B,D)))
-        # x2 → x1
-        q2=self.q2(x2).reshape(B,H,d); k1=self.k1(x1).reshape(B,H,d)
+        q2=self.q2(x2).reshape(B,H,d)
+        k1=self.k1(x1).reshape(B,H,d)
         v1=self.v1(x1).reshape(B,H,d)
         a2=torch.sigmoid((q2*k1*self.scale).sum(-1,keepdim=True))
         x2_r=self.norm2(x2+self.out2((a2*v1).reshape(B,D)))
@@ -663,50 +741,55 @@ class WinnerSwinHybrid(nn.Module):
         super().__init__()
         self.winner_name = winner_class.__name__
 
-        if winner_class==EfficientNetV2Model:
-            self.backbone_a=timm.create_model(
-                'tf_efficientnetv2_s',pretrained=True,num_classes=0,global_pool='')
-            A_DIM=1280; self.attn_a=ECA(A_DIM)
-        elif winner_class==ResNet50Model:
-            base=models.resnet50(pretrained=True)
-            self.backbone_a=nn.Sequential(
-                base.conv1,base.bn1,base.relu,base.maxpool,
-                base.layer1,base.layer2,base.layer3,base.layer4)
-            A_DIM=2048; self.attn_a=CBAM(A_DIM)
-        elif winner_class==VGG19Model:
-            self.backbone_a=models.vgg19_bn(pretrained=True).features
-            A_DIM=512; self.attn_a=CBAM(A_DIM)
+        if winner_class == EfficientNetV2Model:
+            self.backbone_a = timm.create_model(
+                'tf_efficientnetv2_s', pretrained=True,
+                num_classes=0, global_pool='')
+            A_DIM = 1280; self.attn_a = ECA(A_DIM)
+        elif winner_class == ResNet50Model:
+            base = models.resnet50(pretrained=True)
+            self.backbone_a = nn.Sequential(
+                base.conv1, base.bn1, base.relu, base.maxpool,
+                base.layer1, base.layer2, base.layer3, base.layer4)
+            A_DIM = 2048; self.attn_a = CBAM(A_DIM)
+        elif winner_class == VGG19Model:
+            self.backbone_a = models.vgg19_bn(pretrained=True).features
+            A_DIM = 512; self.attn_a = CBAM(A_DIM)
 
         self.gem_a  = GeMPooling(p=3.0)
         self.proj_a = nn.Sequential(
-            nn.Linear(A_DIM,512),nn.LayerNorm(512),nn.GELU(),nn.Dropout(drop*0.5))
+            nn.Linear(A_DIM,512), nn.LayerNorm(512),
+            nn.GELU(), nn.Dropout(drop*0.5))
 
         self.swin      = timm.create_model(
-            'swin_tiny_patch4_window7_224',pretrained=True,num_classes=0)
+            'swin_tiny_patch4_window7_224',
+            pretrained=True, num_classes=0)
         self.swin_norm = nn.LayerNorm(768)
         self.proj_b    = nn.Sequential(
-            nn.Linear(768,512),nn.LayerNorm(512),nn.GELU(),nn.Dropout(drop*0.5))
+            nn.Linear(768,512), nn.LayerNorm(512),
+            nn.GELU(), nn.Dropout(drop*0.5))
 
-        self.cross_attn = CrossAttentionGate(dim=512,heads=8)
-
+        self.cross_attn  = CrossAttentionGate(dim=512, heads=8)
         self.fusion_head = nn.Sequential(
-            nn.Linear(1024,512),nn.LayerNorm(512),nn.GELU(),nn.Dropout(drop),
-            nn.Linear(512,256), nn.GELU(),nn.Dropout(drop/2),
-            nn.Linear(256,128), nn.GELU(),
+            nn.Linear(1024,512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(drop),
+            nn.Linear(512,256),  nn.GELU(), nn.Dropout(drop/2),
+            nn.Linear(256,128),  nn.GELU(),
             nn.Linear(128,num_classes))
 
     def forward_a(self, x):
-        f=self.backbone_a(x); f=self.attn_a(f); f=self.gem_a(f)
+        f = self.backbone_a(x)
+        f = self.attn_a(f)
+        f = self.gem_a(f)
         return self.proj_a(f)
 
     def forward_b(self, x):
-        f=_swin_pool(self.swin.forward_features(x))
+        f = _swin_pool(self.swin.forward_features(x))
         return self.proj_b(self.swin_norm(f))
 
     def forward(self, x):
-        fa=self.forward_a(x); fb=self.forward_b(x)
-        fa,fb=self.cross_attn(fa,fb)
-        return self.fusion_head(torch.cat([fa,fb],dim=1))
+        fa = self.forward_a(x); fb = self.forward_b(x)
+        fa, fb = self.cross_attn(fa, fb)
+        return self.fusion_head(torch.cat([fa, fb], dim=1))
 
 model = WinnerSwinHybrid(WINNER_CLASS, NUM_CLASSES, drop=0.4).to(DEVICE)
 print(f"\n✅ Hybrid: {winner_name} + Swin-T + CrossAttn | "
@@ -716,11 +799,11 @@ print(f"\n✅ Hybrid: {winner_name} + Swin-T + CrossAttn | "
 # ============================================================
 # STEP 12 — Hybrid Training
 # ============================================================
-# Warm-start winner backbone
 winner_state = torch.load(WINNER_SAVE, map_location=DEVICE)
-bb_state = {k:v for k,v in winner_state.items()
-            if 'head' not in k and 'classifier' not in k and 'gem' not in k}
-missing,unexpected = model.load_state_dict(bb_state, strict=False)
+bb_state     = {k:v for k,v in winner_state.items()
+                if 'head' not in k and 'classifier' not in k
+                and 'gem' not in k}
+missing, unexpected = model.load_state_dict(bb_state, strict=False)
 print(f"   Warm-start: {len(bb_state)} keys | "
       f"missing:{len(missing)} unexpected:{len(unexpected)}")
 
@@ -728,15 +811,15 @@ bb_a_ids = {id(p) for p in model.backbone_a.parameters()}
 swin_ids  = {id(p) for p in model.swin.parameters()}
 
 opt = optim.AdamW([
-    {'params':[p for p in model.backbone_a.parameters()], 'lr':LR*0.05},
-    {'params':[p for p in model.swin.parameters()],       'lr':LR*0.10},
-    {'params':[p for p in model.parameters()
-               if id(p) not in bb_a_ids|swin_ids],        'lr':LR},
+    {'params': list(model.backbone_a.parameters()), 'lr': LR*0.05},
+    {'params': list(model.swin.parameters()),       'lr': LR*0.10},
+    {'params': [p for p in model.parameters()
+                if id(p) not in bb_a_ids | swin_ids], 'lr': LR},
 ], weight_decay=WEIGHT_DECAY)
 
-sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt,T_0=10,T_mult=2)
+sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=10, T_mult=2)
 es  = EarlyStopping(patience=PATIENCE, save_path=SAVE_HYBRID)
-train_losses,val_losses,val_accs,lr_hist = [],[],[],[]
+train_losses, val_losses, val_accs, lr_hist = [], [], [], []
 
 print(f"\n🔥 Hybrid Training ({HYBRID_EPOCHS} epochs)")
 print("─"*78)
@@ -744,10 +827,10 @@ print("─"*78)
 for ep in range(1, HYBRID_EPOCHS+1):
     t0  = time.time()
     trl = train_one_epoch(model, train_loader, criterion, opt)
-    vll,vla,_,_,_ = evaluate(model, val_loader, criterion)
+    vll, vla, _, _, _ = evaluate(model, val_loader, criterion)
     sch.step()
     train_losses.append(trl); val_losses.append(vll)
-    val_accs.append(vla); lr_hist.append(opt.param_groups[2]['lr'])
+    val_accs.append(vla);     lr_hist.append(opt.param_groups[2]['lr'])
     stop = es.step(vll, ep, model)
     flag = "🏅 BEST" if es.counter==0 else f"(pat {es.counter}/{PATIENCE})"
     print(f"Ep{ep:02d}/{HYBRID_EPOCHS} | {time.time()-t0:.0f}s | "
@@ -761,13 +844,15 @@ print(f"\n✅ Best hybrid loaded (ep{es.best_epoch})")
 
 
 # ============================================================
-# STEP 13 — Fig 3: Hybrid Training Curves (IEEE)
+# STEP 13 — Fig 3: Hybrid Training Curves  [SEPARATE FIGURE]
 # ============================================================
 ep_r = range(1, len(train_losses)+1)
+
 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
 axes[0].plot(ep_r, train_losses, color=PAL['ours'], lw=2, label='Train')
-axes[0].plot(ep_r, val_losses,   color=PAL['neg'],  lw=2, label='Val', linestyle='--')
+axes[0].plot(ep_r, val_losses,   color=PAL['neg'],  lw=2,
+             label='Val', linestyle='--')
 axes[0].axvline(es.best_epoch, color=PAL['pos'], lw=1.5,
                 linestyle=':', label=f'Best (ep{es.best_epoch})')
 axes[0].set_title("(a) Loss Curves", fontweight='bold')
@@ -783,39 +868,42 @@ axes[1].grid(alpha=0.3, linestyle='--')
 plt.suptitle(f"Fig. 3 — Hybrid ({winner_name} + Swin-T) Training",
              fontsize=11, fontweight='bold', y=1.02)
 plt.tight_layout()
-plt.savefig("fig3_hybrid_training.pdf", bbox_inches='tight')
-plt.savefig("fig3_hybrid_training.png")
-plt.show(); print("✅ Fig 3 saved")
+save_fig("fig3_hybrid_training", "Fig 3 — Hybrid Training Curves")
 
 
 # ============================================================
 # STEP 14 — Test Evaluation
 # ============================================================
-_,_,test_probs,test_preds,test_true = evaluate(model, test_loader, criterion)
-test_probs  = np.array(test_probs)
-m_hybrid    = full_metrics(test_true, test_preds, test_probs)
+_, _, test_probs, test_preds, test_true = evaluate(
+    model, test_loader, criterion)
+test_probs = np.array(test_probs)
+m_hybrid   = full_metrics(test_true, test_preds, test_probs)
 
 print("\n" + "═"*65)
 print(f"🏆  FINAL HYBRID TEST  ({winner_name} + Swin-T + CrossAttn)")
 print("═"*65)
-for label,val in [("Accuracy",       m_hybrid['acc']*100),
-                   ("Macro Precision", m_hybrid['prec']*100),
-                   ("Macro Recall",    m_hybrid['rec']*100),
-                   ("Macro F1",        m_hybrid['mf1']*100),
-                   ("Weighted F1",     m_hybrid['wf1']*100)]:
+for label, val in [
+    ("Accuracy",       m_hybrid['acc']*100),
+    ("Macro Precision",m_hybrid['prec']*100),
+    ("Macro Recall",   m_hybrid['rec']*100),
+    ("Macro F1",       m_hybrid['mf1']*100),
+    ("Weighted F1",    m_hybrid['wf1']*100)]:
     print(f"  {label:<22}: {val:.4f}%")
 print(f"  {'Macro AUC-ROC':<22}: {m_hybrid['auc']:.4f}")
 print("═"*65)
-print(classification_report(test_true, test_preds,
-      target_names=[IDX_TO_CLASS[i] for i in range(NUM_CLASSES)]))
+print(classification_report(
+    test_true, test_preds,
+    target_names=[IDX_TO_CLASS[i] for i in range(NUM_CLASSES)]))
 
 
 # ============================================================
-# STEP 15 — Fig 4: Confusion Matrix (IEEE)
+# STEP 15 — Fig 4: Confusion Matrix  [SEPARATE FIGURE]
 # ============================================================
 cls_short = [IDX_TO_CLASS[i].replace('_',' ') for i in range(NUM_CLASSES)]
-cm        = confusion_matrix(test_true, test_preds, labels=list(range(NUM_CLASSES)))
-cm_pct    = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1) * 100
+cm        = confusion_matrix(test_true, test_preds,
+                             labels=list(range(NUM_CLASSES)))
+cm_pct    = (cm.astype(float)
+             / cm.sum(axis=1, keepdims=True).clip(min=1) * 100)
 
 fig, ax = plt.subplots(figsize=(9, 7))
 sns.heatmap(cm_pct, annot=True, fmt='.1f', cmap='Blues', ax=ax,
@@ -829,42 +917,44 @@ ax.set_ylabel("True Label"); ax.set_xlabel("Predicted Label")
 ax.tick_params(axis='x', rotation=40, labelsize=9)
 ax.tick_params(axis='y', rotation=0,  labelsize=9)
 plt.tight_layout()
-plt.savefig("fig4_confusion_matrix.pdf", bbox_inches='tight')
-plt.savefig("fig4_confusion_matrix.png")
-plt.show(); print("✅ Fig 4 saved")
+save_fig("fig4_confusion_matrix", "Fig 4 — Confusion Matrix")
 
 
 # ============================================================
-# STEP 16 — Fig 5: Per-Class F1 + ROC (IEEE two-column)
+# STEP 16 — Fig 5: Per-Class F1 + ROC  [SEPARATE FIGURE]
 # ============================================================
 per_f1  = f1_score(test_true, test_preds, average=None,
                    zero_division=0, labels=list(range(NUM_CLASSES)))
 y_bin   = label_binarize(test_true, classes=list(range(NUM_CLASSES)))
-roc_pal = plt.cm.tab10(np.linspace(0,1,NUM_CLASSES))
+roc_pal = plt.cm.tab10(np.linspace(0, 1, NUM_CLASSES))
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-# Per-class F1
-bar_cols = [PAL['neg'] if f<0.90 else PAL['pos'] for f in per_f1]
-bars = axes[0].barh(cls_short, per_f1*100, color=bar_cols,
-                    edgecolor='white', linewidth=0.6)
-axes[0].axvline(90, color='navy', lw=1.2, linestyle='--', label='90% threshold')
-axes[0].set_xlim([0,105])
-axes[0].set_xlabel("F1-Score (%)"); axes[0].set_title("(a) Per-Class F1", fontweight='bold')
-axes[0].legend(fontsize=8); axes[0].grid(axis='x', alpha=0.3, linestyle='--')
-for bar,val in zip(bars, per_f1):
+# ── Per-class F1 bar ─────────────────────────────────────────
+bar_cols = [PAL['neg'] if f < 0.90 else PAL['pos'] for f in per_f1]
+bars     = axes[0].barh(cls_short, per_f1*100,
+                        color=bar_cols, edgecolor='white', linewidth=0.6)
+axes[0].axvline(90, color='navy', lw=1.2, linestyle='--',
+                label='90% threshold')
+axes[0].set_xlim([0, 105])
+axes[0].set_xlabel("F1-Score (%)")
+axes[0].set_title("(a) Per-Class F1", fontweight='bold')
+axes[0].legend(fontsize=8)
+axes[0].grid(axis='x', alpha=0.3, linestyle='--')
+for bar, val in zip(bars, per_f1):
     axes[0].text(val*100+0.5, bar.get_y()+bar.get_height()/2,
                  f"{val*100:.1f}", va='center', fontsize=8)
 
-# ROC curves
+# ── ROC curves ───────────────────────────────────────────────
 for i in range(NUM_CLASSES):
-    if y_bin[:,i].sum()==0: continue
-    fpr,tpr,_ = roc_curve(y_bin[:,i], test_probs[:,i])
+    if y_bin[:,i].sum() == 0: continue          # skip absent class
+    fpr, tpr, _ = roc_curve(y_bin[:,i], test_probs[:,i])
     ai = roc_auc_score(y_bin[:,i], test_probs[:,i])
     axes[1].plot(fpr, tpr, color=roc_pal[i], lw=1.6,
                  label=f"{cls_short[i]} ({ai:.3f})")
 axes[1].plot([0,1],[0,1],'k--',lw=1,alpha=0.5)
-axes[1].set_xlabel("False Positive Rate"); axes[1].set_ylabel("True Positive Rate")
+axes[1].set_xlabel("False Positive Rate")
+axes[1].set_ylabel("True Positive Rate")
 axes[1].set_title("(b) ROC Curves (One-vs-Rest)", fontweight='bold')
 axes[1].legend(fontsize=7, loc='lower right')
 axes[1].grid(alpha=0.3, linestyle='--')
@@ -872,13 +962,11 @@ axes[1].grid(alpha=0.3, linestyle='--')
 plt.suptitle("Fig. 5 — Per-Class F1 and ROC Analysis",
              fontsize=11, fontweight='bold', y=1.02)
 plt.tight_layout()
-plt.savefig("fig5_f1_roc.pdf", bbox_inches='tight')
-plt.savefig("fig5_f1_roc.png")
-plt.show(); print("✅ Fig 5 saved")
+save_fig("fig5_f1_roc", "Fig 5 — Per-Class F1 + ROC")
 
 
 # ============================================================
-# STEP 17 — Fig 6: XAI — Grad-CAM++ + EigenCAM (IEEE)
+# STEP 17 — Fig 6: XAI — Grad-CAM++ + EigenCAM  [SEPARATE FIGURE]
 # ============================================================
 try:
     from pytorch_grad_cam import GradCAMPlusPlus, EigenCAM
@@ -894,56 +982,56 @@ try:
     else:   # VGG19
         tgt_a = [list(model.backbone_a.children())[-2]]
 
-    # Swin EigenCAM needs (B,C,H,W) output
     class SwinWrapper(nn.Module):
         def __init__(self, m):
             super().__init__(); self.m = m
         def forward(self, x):
-            f = self.m.swin.forward_features(x)   # (B,H,W,C) or (B,C)
-            if f.dim()==4:
+            f = self.m.swin.forward_features(x)
+            if f.dim() == 4:
                 return f.permute(0,3,1,2).contiguous()
             return f.unsqueeze(-1).unsqueeze(-1)
 
     swin_wrap = SwinWrapper(model)
     tgt_b     = [model.swin.layers[-1].blocks[-1]]
 
-    cam_winner = GradCAMPlusPlus(model=model,      target_layers=tgt_a)
-    cam_swin   = EigenCAM(       model=swin_wrap,  target_layers=tgt_b)
+    cam_winner = GradCAMPlusPlus(model=model,     target_layers=tgt_a)
+    cam_swin   = EigenCAM(       model=swin_wrap, target_layers=tgt_b)
 
-    # One sample per class
     sample_idxs = []
     for ci in range(NUM_CLASSES):
         cands = [i for i,l in enumerate(test_labels) if l==ci]
-        if cands: sample_idxs.append(int(np.random.choice(cands)))
+        if cands:
+            sample_idxs.append(int(np.random.choice(cands)))
 
     n_show = min(8, len(sample_idxs))
     fig, axes = plt.subplots(n_show, 3, figsize=(12, 3.5*n_show))
-    if n_show==1: axes=[axes]
+    if n_show == 1: axes = [axes]
 
     col_titles = ["Original Image",
                   f"{winner_name[:16]}\n(Grad-CAM++)",
                   "Swin-T\n(EigenCAM)"]
-    for ax,title in zip(axes[0], col_titles):
+    for ax, title in zip(axes[0], col_titles):
         ax.set_title(title, fontsize=9, fontweight='bold')
 
-    for row,idx in enumerate(sample_idxs[:n_show]):
-        raw = Image.open(test_paths[idx]).convert("RGB").resize((IMG_SIZE,IMG_SIZE))
-        rgb = np.array(raw)/255.0
+    for row, idx in enumerate(sample_idxs[:n_show]):
+        raw = Image.open(test_paths[idx]).convert("RGB").resize(
+            (IMG_SIZE, IMG_SIZE))
+        rgb = np.array(raw) / 255.0
         inp = val_tf(raw).unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
             logits = model(inp)
             pred   = logits.argmax(-1).item()
-            conf   = F.softmax(logits,-1)[0,pred].item()
+            conf   = F.softmax(logits,-1)[0, pred].item()
 
         try:
             gc_w = cam_winner(input_tensor=inp)[0]
             gc_s = cam_swin(  input_tensor=inp)[0]
         except Exception as ex:
             print(f"  CAM error row {row}: {ex}")
-            gc_w = gc_s = np.zeros((IMG_SIZE,IMG_SIZE))
+            gc_w = gc_s = np.zeros((IMG_SIZE, IMG_SIZE))
 
-        correct = pred==test_labels[idx]
+        correct = pred == test_labels[idx]
         lbl_col = PAL['pos'] if correct else PAL['neg']
         tick    = '✓' if correct else '✗'
 
@@ -954,7 +1042,7 @@ try:
             Image.fromarray(show_cam_on_image(
                 rgb.astype(np.float32), gc_s, use_rgb=True)),
         ]
-        for col,im in enumerate(overlays):
+        for col, im in enumerate(overlays):
             axes[row][col].imshow(im)
             axes[row][col].axis('off')
 
@@ -968,124 +1056,135 @@ try:
         "Warmer colours indicate higher contribution to prediction.",
         fontsize=10, fontweight='bold', y=1.01)
     plt.tight_layout()
-    plt.savefig("fig6_xai_gradcam.pdf", bbox_inches='tight')
-    plt.savefig("fig6_xai_gradcam.png")
-    plt.show(); print("✅ Fig 6 — XAI saved")
+    save_fig("fig6_xai_gradcam", "Fig 6 — XAI Grad-CAM++ + EigenCAM")
 
 except Exception as e:
     print(f"⚠️  XAI skipped: {e}")
+    plt.close('all')
 
 
 # ============================================================
-# STEP 18 — Fig 7: Branch Contribution (IEEE)
+# STEP 18 — Fig 7: Branch Contribution  [SEPARATE FIGURE]
 # ============================================================
 try:
     model.eval()
-    eff_norms  = {i:[] for i in range(NUM_CLASSES)}
-    swin_norms = {i:[] for i in range(NUM_CLASSES)}
+    eff_norms  = {i: [] for i in range(NUM_CLASSES)}
+    swin_norms = {i: [] for i in range(NUM_CLASSES)}
 
     with torch.no_grad():
-        for imgs,lbls in test_loader:
+        for imgs, lbls in test_loader:
             imgs = imgs.to(DEVICE)
             fa   = model.forward_a(imgs)
             fb   = model.forward_b(imgs)
-            for i,l in enumerate(lbls.numpy()):
-                eff_norms[l].append(fa[i].norm().item())
+            for i, l in enumerate(lbls.numpy()):
+                eff_norms[l].append( fa[i].norm().item())
                 swin_norms[l].append(fb[i].norm().item())
 
-    avg_a = [np.mean(eff_norms[i])  if eff_norms[i]  else 0 for i in range(NUM_CLASSES)]
-    avg_b = [np.mean(swin_norms[i]) if swin_norms[i] else 0 for i in range(NUM_CLASSES)]
+    avg_a = [np.mean(eff_norms[i])  if eff_norms[i]  else 0
+             for i in range(NUM_CLASSES)]
+    avg_b = [np.mean(swin_norms[i]) if swin_norms[i] else 0
+             for i in range(NUM_CLASSES)]
 
     x, w = np.arange(NUM_CLASSES), 0.35
+
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.bar(x-w/2, avg_a, w, label=f'{winner_name[:18]} (Local Texture)',
+    ax.bar(x-w/2, avg_a, w,
+           label=f'{winner_name[:18]} (Local Texture)',
            color=PAL['vgg'], edgecolor='white')
-    ax.bar(x+w/2, avg_b, w, label='Swin-T (Global Structure)',
+    ax.bar(x+w/2, avg_b, w,
+           label='Swin-T (Global Structure)',
            color=PAL['swin'], edgecolor='white')
     ax.set_xticks(x)
-    ax.set_xticklabels([IDX_TO_CLASS[i].replace('_',' ')
-                        for i in range(NUM_CLASSES)],
-                       rotation=30, ha='right', fontsize=9)
+    ax.set_xticklabels(
+        [IDX_TO_CLASS[i].replace('_',' ') for i in range(NUM_CLASSES)],
+        rotation=30, ha='right', fontsize=9)
     ax.set_ylabel("Mean L2 Norm of Branch Feature Vector")
     ax.set_title("Fig. 7 — Branch Feature Contribution per Disease Class",
                  fontweight='bold')
-    ax.legend(fontsize=9); ax.grid(axis='y', alpha=0.3, linestyle='--')
+    ax.legend(fontsize=9)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
     plt.tight_layout()
-    plt.savefig("fig7_branch_contribution.pdf", bbox_inches='tight')
-    plt.savefig("fig7_branch_contribution.png")
-    plt.show(); print("✅ Fig 7 saved")
+    save_fig("fig7_branch_contribution", "Fig 7 — Branch Contribution")
 
 except Exception as e:
     print(f"⚠️  Branch analysis skipped: {e}")
+    plt.close('all')
 
 
 # ============================================================
-# STEP 19 — Fig 8: Robustness (IEEE)
+# STEP 19 — Fig 8: Robustness  [SEPARATE FIGURE]
 # ============================================================
 class NoisyDS(StrawberryDataset):
     def __init__(self, paths, labels, tf, sigma):
         super().__init__(paths, labels, tf, False)
         self.sigma = sigma
     def __getitem__(self, idx):
-        img,lbl = super().__getitem__(idx)
-        if self.sigma>0: img = img+torch.randn_like(img)*self.sigma
-        return img,lbl
+        img, lbl = super().__getitem__(idx)
+        if self.sigma > 0:
+            img = img + torch.randn_like(img) * self.sigma
+        return img, lbl
 
 print("\n🛡️  Robustness evaluation...")
 rob_results = []
 for sigma in [0.0, 0.05, 0.10, 0.20, 0.30]:
-    nl = DataLoader(NoisyDS(test_paths,test_labels,val_tf,sigma),
-                    batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
-    _,acc_n,_,preds_n,true_n = evaluate(model, nl, criterion)
-    f1_n = f1_score(true_n,preds_n,average='macro',zero_division=0)
-    rob_results.append({'sigma':sigma,'acc':acc_n*100,'f1':f1_n*100})
+    nl = DataLoader(
+        NoisyDS(test_paths, test_labels, val_tf, sigma),
+        batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    _, acc_n, _, preds_n, true_n = evaluate(model, nl, criterion)
+    f1_n = f1_score(true_n, preds_n, average='macro', zero_division=0)
+    rob_results.append({'sigma':sigma, 'acc':acc_n*100, 'f1':f1_n*100})
     print(f"  σ={sigma:.2f} → Acc:{acc_n*100:.2f}%  F1:{f1_n*100:.2f}%")
 
 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 sigs = [r['sigma'] for r in rob_results]
-axes[0].plot(sigs,[r['acc'] for r in rob_results],
-             color=PAL['ours'],marker='o',ms=7,lw=2)
+
+axes[0].plot(sigs, [r['acc'] for r in rob_results],
+             color=PAL['ours'], marker='o', ms=7, lw=2)
 axes[0].set_title("(a) Accuracy vs. Noise σ", fontweight='bold')
 axes[0].set_xlabel("Gaussian σ"); axes[0].set_ylabel("Accuracy (%)")
-axes[0].grid(alpha=0.3,linestyle='--')
+axes[0].grid(alpha=0.3, linestyle='--')
 
-axes[1].plot(sigs,[r['f1'] for r in rob_results],
-             color=PAL['neg'],marker='s',ms=7,lw=2)
+axes[1].plot(sigs, [r['f1'] for r in rob_results],
+             color=PAL['neg'], marker='s', ms=7, lw=2)
 axes[1].set_title("(b) Macro F1 vs. Noise σ", fontweight='bold')
 axes[1].set_xlabel("Gaussian σ"); axes[1].set_ylabel("Macro F1 (%)")
-axes[1].grid(alpha=0.3,linestyle='--')
+axes[1].grid(alpha=0.3, linestyle='--')
 
 plt.suptitle("Fig. 8 — Model Robustness Under Gaussian Noise",
              fontsize=11, fontweight='bold', y=1.02)
 plt.tight_layout()
-plt.savefig("fig8_robustness.pdf", bbox_inches='tight')
-plt.savefig("fig8_robustness.png")
-plt.show(); print("✅ Fig 8 saved")
+save_fig("fig8_robustness", "Fig 8 — Robustness")
 
 
 # ============================================================
-# STEP 20 — Fig 9: Ablation Study (IEEE)
+# STEP 20 — Fig 9: Ablation Study  [SEPARATE FIGURE]
 # ============================================================
 print("\n🔬  Ablation study...")
 
 class BranchOnlyA(nn.Module):
     def __init__(self, m, nc):
         super().__init__()
-        self.backbone_a=m.backbone_a; self.attn_a=m.attn_a; self.gem_a=m.gem_a
-        dim = (1280 if WINNER_CLASS==EfficientNetV2Model
-               else 2048 if WINNER_CLASS==ResNet50Model else 512)
-        self.head=nn.Linear(dim, nc)
+        self.backbone_a = m.backbone_a
+        self.attn_a     = m.attn_a
+        self.gem_a      = m.gem_a
+        dim = (1280 if WINNER_CLASS == EfficientNetV2Model
+               else 2048 if WINNER_CLASS == ResNet50Model else 512)
+        self.head = nn.Linear(dim, nc)
     def forward(self, x):
-        f=self.backbone_a(x); f=self.attn_a(f); f=self.gem_a(f)
+        f = self.backbone_a(x)
+        f = self.attn_a(f)
+        f = self.gem_a(f)
         return self.head(f)
 
 class BranchOnlyB(nn.Module):
     def __init__(self, m, nc):
         super().__init__()
-        self.swin=m.swin; self.norm=m.swin_norm
-        self.head=nn.Linear(768, nc)
+        self.swin = m.swin
+        self.norm = m.swin_norm
+        self.head = nn.Linear(768, nc)
     def forward(self, x):
-        return self.head(self.norm(_swin_pool(self.swin.forward_features(x))))
+        return self.head(
+            self.norm(_swin_pool(self.swin.forward_features(x))))
 
 ablation_results = {}
 for abl_name, abl_model in [
@@ -1093,31 +1192,31 @@ for abl_name, abl_model in [
     ("Swin-T Only",              BranchOnlyB(model, NUM_CLASSES)),
 ]:
     abl_model = abl_model.to(DEVICE)
-    for p in abl_model.parameters(): p.requires_grad=False
-    for p in abl_model.head.parameters(): p.requires_grad=True
+    for p in abl_model.parameters():   p.requires_grad = False
+    for p in abl_model.head.parameters(): p.requires_grad = True
     opt_a = optim.AdamW(abl_model.head.parameters(), lr=1e-3)
     for _ in range(5):
         abl_model.train()
-        for imgs,lbls in train_loader:
-            imgs,lbls = imgs.to(DEVICE), lbls.to(DEVICE)
+        for imgs, lbls in train_loader:
+            imgs, lbls = imgs.to(DEVICE), lbls.to(DEVICE)
             opt_a.zero_grad()
             criterion(abl_model(imgs), lbls).backward()
             opt_a.step()
-    _,acc_a,_,p_a,g_a = evaluate(abl_model, test_loader, criterion)
-    f1_a = f1_score(g_a,p_a,average='macro',zero_division=0)
+    _, acc_a, _, p_a, g_a = evaluate(abl_model, test_loader, criterion)
+    f1_a = f1_score(g_a, p_a, average='macro', zero_division=0)
     ablation_results[abl_name] = (acc_a*100, f1_a*100)
     del abl_model; torch.cuda.empty_cache()
 
-ablation_results['Full Hybrid (Ours)'] = (m_hybrid['acc']*100, m_hybrid['mf1']*100)
+ablation_results['Full Hybrid (Ours)'] = (
+    m_hybrid['acc']*100, m_hybrid['mf1']*100)
 
 # Print table
 print(f"\n  {'Variant':<38} {'Accuracy':>10} {'Macro F1':>10}")
-print("  "+"─"*60)
-for name,(a,f) in ablation_results.items():
+print("  " + "─"*60)
+for name, (a, f) in ablation_results.items():
     mk = " ★" if 'Ours' in name else ""
     print(f"  {name:<38} {a:>9.2f}%  {f:>9.2f}%{mk}")
 
-# Bar chart
 abl_names = list(ablation_results.keys())
 abl_f1    = [ablation_results[n][1] for n in abl_names]
 abl_cols  = [PAL['vgg'], PAL['swin'], PAL['ours']]
@@ -1128,17 +1227,16 @@ bars = ax.bar(abl_names, abl_f1, color=abl_cols,
 ax.set_ylabel("Macro F1 (%)")
 ax.set_title("Fig. 9 — Ablation Study: Branch Contribution to Final F1",
              fontweight='bold')
-ax.set_ylim([max(0,min(abl_f1)-10), min(100,max(abl_f1)+5)])
+ax.set_ylim([max(0, min(abl_f1)-10), min(100, max(abl_f1)+5)])
 ax.set_xticklabels(abl_names, rotation=15, ha='right', fontsize=9)
 ax.grid(axis='y', alpha=0.3, linestyle='--')
-for bar,val in zip(bars,abl_f1):
-    ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.3,
+for bar, val in zip(bars, abl_f1):
+    ax.text(bar.get_x()+bar.get_width()/2,
+            bar.get_height()+0.3,
             f"{val:.2f}%", ha='center', va='bottom',
             fontsize=9, fontweight='bold')
 plt.tight_layout()
-plt.savefig("fig9_ablation.pdf", bbox_inches='tight')
-plt.savefig("fig9_ablation.png")
-plt.show(); print("✅ Fig 9 saved")
+save_fig("fig9_ablation", "Fig 9 — Ablation Study")
 
 
 # ============================================================
@@ -1148,15 +1246,15 @@ print("\n" + "═"*65)
 print("📋  ALL FIGURES SAVED (PDF + PNG, IEEE-ready)")
 print("═"*65)
 figs = [
-    ("Fig 1", "fig1_benchmark_curves",      "Benchmark learning curves"),
-    ("Fig 2", "fig2_benchmark_bars",         "Benchmark metric comparison"),
-    ("Fig 3", "fig3_hybrid_training",        "Hybrid training curves"),
-    ("Fig 4", "fig4_confusion_matrix",       "Confusion matrix"),
-    ("Fig 5", "fig5_f1_roc",                 "Per-class F1 + ROC"),
-    ("Fig 6", "fig6_xai_gradcam",            "XAI: Grad-CAM++ + EigenCAM"),
-    ("Fig 7", "fig7_branch_contribution",    "Branch feature contribution"),
-    ("Fig 8", "fig8_robustness",             "Robustness under noise"),
-    ("Fig 9", "fig9_ablation",               "Ablation study"),
+    ("Fig 1", "fig1_benchmark_curves",   "Benchmark learning curves"),
+    ("Fig 2", "fig2_benchmark_bars",      "Benchmark metric comparison"),
+    ("Fig 3", "fig3_hybrid_training",     "Hybrid training curves"),
+    ("Fig 4", "fig4_confusion_matrix",    "Confusion matrix"),
+    ("Fig 5", "fig5_f1_roc",              "Per-class F1 + ROC"),
+    ("Fig 6", "fig6_xai_gradcam",         "XAI: Grad-CAM++ + EigenCAM"),
+    ("Fig 7", "fig7_branch_contribution", "Branch feature contribution"),
+    ("Fig 8", "fig8_robustness",          "Robustness under noise"),
+    ("Fig 9", "fig9_ablation",            "Ablation study"),
 ]
 for fig_id, fname, desc in figs:
     pdf_ok = "✓" if os.path.exists(fname+".pdf") else "✗"

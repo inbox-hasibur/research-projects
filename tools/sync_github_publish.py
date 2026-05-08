@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Copy all .py files from each Project_* folder into github_publish/ (mirror paths).
+Copy ONLY .py files from each Project_* folder into github_publish/ (mirror paths).
+No .tex, .bib, .png, .jpg, .pdf, .md, .docx — code only.
 Skips venv, data, __pycache__, etc. — no .env copy (those live outside or are not .py).
 
 New project = new folder named Project_Something under repo root → next sync picks it up
@@ -60,7 +61,7 @@ def discover_project_dirs() -> list[Path]:
 
 def iter_files(project_dir: Path) -> list[Path]:
     files: list[Path] = []
-    extensions = ("*.py", "*.tex", "*.bib", "*.png", "*.jpg", "*.pdf", "*.md", "*.docx")
+    extensions = ("*.py",)   # ONLY .py files
     for ext in extensions:
         for f in project_dir.rglob(ext):
             if _should_skip(f):
