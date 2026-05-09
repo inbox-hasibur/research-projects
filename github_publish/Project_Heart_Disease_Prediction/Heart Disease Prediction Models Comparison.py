@@ -42,9 +42,9 @@ print('All imports OK')
 # ============================================================
 # Phase 1: Data Loading & EDA
 # ============================================================
-DATA_PATH = '/kaggle/input/personal-key-indicators-of-heart-disease/heart_2022_no_nans.csv'
+DATA_PATH = '/kaggle/input/datasets/kamilpytlak/personal-key-indicators-of-heart-disease/2022/heart_2022_with_nans.csv'
 if not os.path.exists(DATA_PATH):
-    DATA_PATH = 'heart_2022_no_nans.csv'
+    DATA_PATH = 'heart_2022_with_nans.csv'
 
 df = pd.read_csv(DATA_PATH)
 print(f'Raw dataset: {df.shape[0]} rows x {df.shape[1]} columns')
@@ -64,10 +64,18 @@ axes[1].pie(pct, labels=['No Disease','Heart Disease'], autopct='%1.1f%%',
 axes[1].set_title('Class Proportion')
 plt.tight_layout(); plt.savefig('01_class_distribution.png', bbox_inches='tight'); plt.show()
 
-# --- Missing values ---
+# --- Handle missing values ---
 missing = df.isnull().sum()
 if missing.sum() > 0:
-    print(f'\nMissing values:\n{missing[missing>0]}')
+    print(f'\nMissing values before imputation:\n{missing[missing>0]}')
+    # Impute continuous with median, categorical/binary with mode
+    for col in df.columns:
+        if df[col].isnull().sum() > 0:
+            if df[col].dtype in ['float64', 'int64']:
+                df[col].fillna(df[col].median(), inplace=True)
+            else:
+                df[col].fillna(df[col].mode()[0], inplace=True)
+    print(f'Missing values after imputation: {df.isnull().sum().sum()}')
 else:
     print('\nNo missing values detected.')
 
@@ -268,7 +276,7 @@ cb = CatBoostClassifier(
     random_seed=RANDOM_STATE, early_stopping_rounds=30
 )
 cb.fit(X_train_bal, y_train_bal,
-       eval_set=(X_test, y_test), verbose=100)
+       eval_set=Pool(X_test, y_test, cat_features=cat_col_indices), verbose=100)
 train_times['CatBoost'] = time.time() - t0
 models['CatBoost'] = cb
 print(f"Trained in {train_times['CatBoost']:.1f}s")
@@ -293,7 +301,7 @@ cb_wrap.fit(X_train_np, y_train_np)
 
 voting = VotingClassifier(
     estimators=[('lr', lr), ('rf', rf), ('cb', cb_wrap)],
-    voting='soft', n_jobs=-1)
+    voting='soft')
 voting.fit(X_train_np, y_train_np)
 train_times['Voting Ensemble'] = time.time() - t0
 models['Voting Ensemble'] = voting
@@ -321,7 +329,7 @@ for name, model in models.items():
     print(f'  {name}')
     print(f'{"="*40}')
     if name == 'CatBoost':
-        y_pred = model.predict(X_test).flatten()
+        y_pred = model.predict(X_test).astype(int).flatten()
         y_prob = model.predict_proba(X_test)[:, 1]
     else:
         y_pred = model.predict(X_test_np)
@@ -431,9 +439,9 @@ shap_results = {}
 # --- Model 1: Logistic Regression — LinearExplainer ---
 print('\n--- SHAP: Logistic Regression ---')
 t0 = time.time()
-X_train_sample_lr = X_train_bal[:500]
+X_train_sample_lr = X_train_bal[:500].values
 explainer_lr = shap.LinearExplainer(lr, X_train_sample_lr)
-shap_vals_lr = explainer_lr.shap_values(X_test[:500])
+shap_vals_lr = explainer_lr.shap_values(X_test[:500].values)
 shap_results['Logistic Regression'] = {
     'explainer': explainer_lr, 'values': shap_vals_lr,
     'time': time.time() - t0, 'method': 'LinearExplainer'
@@ -441,7 +449,7 @@ shap_results['Logistic Regression'] = {
 print(f"SHAP computed in {time.time()-t0:.2f}s (LinearExplainer — exact)")
 
 fig, ax = plt.subplots(figsize=(10, 6))
-shap.summary_plot(shap_vals_lr, X_test[:500], feature_names=feature_names,
+shap.summary_plot(shap_vals_lr, X_test[:500].values, feature_names=feature_names,
                   show=False, max_display=15)
 plt.title('SHAP Summary — Logistic Regression')
 plt.tight_layout(); plt.savefig('10_shap_lr_summary.png', bbox_inches='tight'); plt.show()
@@ -450,12 +458,14 @@ plt.tight_layout(); plt.savefig('10_shap_lr_summary.png', bbox_inches='tight'); 
 print('\n--- SHAP: Random Forest ---')
 t0 = time.time()
 explainer_rf = shap.TreeExplainer(rf)
-shap_vals_rf = explainer_rf.shap_values(X_test[:500])
+shap_vals_rf = explainer_rf.shap_values(X_test[:500].values)
 # For binary classification, take class 1 SHAP values
 if isinstance(shap_vals_rf, list):
     shap_vals_rf_pos = shap_vals_rf[1]
+elif len(shap_vals_rf.shape) == 3:
+    shap_vals_rf_pos = shap_vals_rf[:, :, 1]
 else:
-    shap_vals_rf_pos = shap_vals_rf[:, :, 1] if len(shap_vals_rf.shape) == 3 else shap_vals_rf
+    shap_vals_rf_pos = shap_vals_rf
 shap_results['Random Forest'] = {
     'explainer': explainer_rf, 'values': shap_vals_rf_pos,
     'time': time.time() - t0, 'method': 'TreeExplainer'
@@ -463,7 +473,7 @@ shap_results['Random Forest'] = {
 print(f"SHAP computed in {time.time()-t0:.2f}s (TreeExplainer — exact)")
 
 fig, ax = plt.subplots(figsize=(10, 6))
-shap.summary_plot(shap_vals_rf_pos, X_test[:500], feature_names=feature_names,
+shap.summary_plot(shap_vals_rf_pos, X_test[:500].values, feature_names=feature_names,
                   show=False, max_display=15)
 plt.title('SHAP Summary — Random Forest')
 plt.tight_layout(); plt.savefig('11_shap_rf_summary.png', bbox_inches='tight'); plt.show()
@@ -472,7 +482,7 @@ plt.tight_layout(); plt.savefig('11_shap_rf_summary.png', bbox_inches='tight'); 
 print('\n--- SHAP: CatBoost ---')
 t0 = time.time()
 explainer_cb = shap.TreeExplainer(cb)
-shap_vals_cb = explainer_cb.shap_values(Pool(X_test[:500], cat_features=cat_col_indices))
+shap_vals_cb = explainer_cb.shap_values(X_test[:500].values)
 # CatBoost returns list for binary; take class 1
 if isinstance(shap_vals_cb, list):
     shap_vals_cb_pos = shap_vals_cb[1]
@@ -485,7 +495,7 @@ shap_results['CatBoost'] = {
 print(f"SHAP computed in {time.time()-t0:.2f}s (TreeExplainer — exact)")
 
 fig, ax = plt.subplots(figsize=(10, 6))
-shap.summary_plot(shap_vals_cb_pos, X_test[:500], feature_names=feature_names,
+shap.summary_plot(shap_vals_cb_pos, X_test[:500].values, feature_names=feature_names,
                   show=False, max_display=15)
 plt.title('SHAP Summary — CatBoost (Recommended Deployment Model)')
 plt.tight_layout(); plt.savefig('12_shap_cb_summary.png', bbox_inches='tight'); plt.show()
@@ -493,7 +503,7 @@ plt.tight_layout(); plt.savefig('12_shap_cb_summary.png', bbox_inches='tight'); 
 # --- CatBoost Beeswarm Plot ---
 fig, ax = plt.subplots(figsize=(10, 8))
 shap.plots.beeswarm(shap.Explanation(values=shap_vals_cb_pos,
-                                     base_values=explainer_cb.expected_value[1] if isinstance(explainer_cb.expected_value, list) else explainer_cb.expected_value,
+                                     base_values=float(explainer_cb.expected_value[1] if isinstance(explainer_cb.expected_value, list) else explainer_cb.expected_value),
                                      data=X_test[:500].values,
                                      feature_names=feature_names),
                      max_display=15, show=False)
@@ -503,7 +513,7 @@ plt.tight_layout(); plt.savefig('13_shap_cb_beeswarm.png', bbox_inches='tight');
 # --- CatBoost Waterfall (single patient explanation) ---
 patient_idx = 0
 shap_exp = shap.Explanation(values=shap_vals_cb_pos[patient_idx],
-                            base_values=explainer_cb.expected_value[1] if isinstance(explainer_cb.expected_value, list) else explainer_cb.expected_value,
+                            base_values=float(explainer_cb.expected_value[1] if isinstance(explainer_cb.expected_value, list) else explainer_cb.expected_value),
                             data=X_test.iloc[patient_idx].values,
                             feature_names=feature_names)
 fig, ax = plt.subplots(figsize=(10, 8))
@@ -537,7 +547,7 @@ shap_results['Voting Ensemble'] = {
 }
 
 fig, ax = plt.subplots(figsize=(10, 6))
-shap.summary_plot(shap_vals_voting_pos, X_test[:50], feature_names=feature_names,
+shap.summary_plot(shap_vals_voting_pos, X_test_np[:50], feature_names=feature_names,
                   show=False, max_display=15)
 plt.title('SHAP Summary — Voting Ensemble (KernelExplainer)')
 plt.tight_layout(); plt.savefig('15_shap_voting_summary.png', bbox_inches='tight'); plt.show()
