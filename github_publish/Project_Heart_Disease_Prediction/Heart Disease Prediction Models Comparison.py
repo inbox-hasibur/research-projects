@@ -292,31 +292,40 @@ train_times['CatBoost'] = time.time() - t0
 models['CatBoost'] = cb
 print(f"Trained in {train_times['CatBoost']:.1f}s")
 
-# --- Model 4: Voting Ensemble (LR + RF + CatBoost, soft voting) ---
+# --- Model 4: Voting Ensemble (LR + RF + CatBoost, manual soft voting) ---
 print('\n--- Model 4: Voting Ensemble ---')
 t0 = time.time()
-from sklearn.base import BaseEstimator, ClassifierMixin
 
-class CatBoostWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, cb_model):
-        self.cb_model = cb_model
-    def fit(self, X, y):
-        return self
-    def predict(self, X):
-        return self.cb_model.predict(X)
+class SoftVotingEnsemble:
+    """Manual soft-voting ensemble — averages predict_proba from LR, RF, CatBoost.
+    Avoids sklearn VotingClassifier which cannot wrap CatBoost (GPU model)."""
+    def __init__(self, estimators, weights=None):
+        self.estimators = estimators  # list of (name, model) tuples
+        self.weights = weights if weights is not None else [1.0] * len(estimators)
+        self.classes_ = estimators[0][1].classes_ if hasattr(estimators[0][1], 'classes_') else np.array([0, 1])
+
     def predict_proba(self, X):
-        return self.cb_model.predict_proba(X)
+        probas = []
+        for (name, model), w in zip(self.estimators, self.weights):
+            if name == 'CatBoost':
+                p = model.predict_proba(X)
+            else:
+                p = model.predict_proba(X)
+            probas.append(p * w)
+        avg = sum(probas) / sum(self.weights)
+        return avg
 
-cb_wrap = CatBoostWrapper(cb)
-cb_wrap.fit(X_train_np, y_train_np)
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return (proba[:, 1] >= 0.5).astype(int)
 
-voting = VotingClassifier(
-    estimators=[('lr', lr), ('rf', rf), ('cb', cb_wrap)],
-    voting='soft')
-voting.fit(X_train_np, y_train_np)
+voting = SoftVotingEnsemble(
+    estimators=[('Logistic Regression', lr), ('Random Forest', rf), ('CatBoost', cb)],
+    weights=[1.0, 1.0, 1.5]  # weight CatBoost slightly higher (best standalone)
+)
 train_times['Voting Ensemble'] = time.time() - t0
 models['Voting Ensemble'] = voting
-print(f"Trained in {train_times['Voting Ensemble']:.1f}s")
+print(f"Ensemble assembled in {train_times['Voting Ensemble']:.1f}s")
 
 print('\nAll 4 models trained.')
 for name, t in train_times.items():
@@ -556,7 +565,7 @@ shap_results['Voting Ensemble'] = {
 }
 
 fig, ax = plt.subplots(figsize=(10, 6))
-shap.summary_plot(shap_vals_voting_pos, X_test[:50], feature_names=feature_names,
+shap.summary_plot(shap_vals_voting_pos, X_test_np[:50], feature_names=feature_names,
                   show=False, max_display=15)
 plt.title('SHAP Summary — Voting Ensemble (KernelExplainer)')
 plt.tight_layout(); plt.savefig('15_shap_voting_summary.png', bbox_inches='tight'); plt.show()
