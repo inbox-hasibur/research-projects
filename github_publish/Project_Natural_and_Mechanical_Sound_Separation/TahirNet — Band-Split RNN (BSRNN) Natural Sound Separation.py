@@ -10,6 +10,7 @@ import random
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import glob
 from tqdm import tqdm
 
 import torch
@@ -18,7 +19,7 @@ import torch.nn.functional as F
 import torchaudio
 import torchaudio.transforms as T
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import torch.nn.utils.prune as prune
 
 # ─────────────────────────────────────────
@@ -38,6 +39,7 @@ CONFIG = {
     # Paths
     "data_dir"         : Path("/kaggle/input/datasets/inboxhasibur/mecnature-audio-dataset"),
     "output_dir"       : Path("/kaggle/working/tahirnet"),
+    "resume_checkpoint": "",  # e.g., "/kaggle/input/tahirnet-checkpoint/tahirnet_ep004_latest.pt"
 
     # Audio
     "sr"               : 22050,
@@ -59,16 +61,48 @@ CONFIG = {
     "epochs"           : 200,
     "lr"               : 3e-4,
     "weight_decay"     : 1e-4,
-    "patience"         : 15,
+    "patience"         : 5,
     "grad_clip"        : 5.0,
-    "time_limit_hr"    : 10.3,
+    "time_limit_hr"    : 11.5,
 
     # Loss
     "lambda_freq"      : 0.5,
 
     # Pruning
-    "prune_amount"     : 0.25,
+    "prune_amount"     : 0.15
 }
+
+def save_checkpoint(model, optimizer, scaler, epoch, val_loss, history, is_best=False, suffix=""):
+    state = {
+        "epoch": epoch,
+        "val_loss": val_loss,
+        "history": history,
+        "opt_state": optimizer.state_dict(),
+        "scaler_state": scaler.state_dict()
+    }
+    
+    # Strip module. prefix if DataParallel is used
+    if isinstance(model, nn.DataParallel):
+        state["model_state"] = model.module.state_dict()
+    else:
+        state["model_state"] = model.state_dict()
+        
+    if is_best:
+        # Delete old best checkpoints (except the generic one)
+        for f in glob.glob(str(OUT_DIR / "*_best.pt")):
+            if "tahirnet_best.pt" != Path(f).name:
+                Path(f).unlink(missing_ok=True)
+        filename = OUT_DIR / f"tahirnet_ep{epoch:03d}_best.pt"
+        torch.save(state, filename)
+        # Always keep the generic name for easy loading by the test script
+        torch.save(state["model_state"], OUT_DIR / "tahirnet_best.pt")
+    elif suffix:
+        if suffix == "latest":
+            # Delete old latest checkpoints to save Kaggle disk space
+            for f in glob.glob(str(OUT_DIR / "*_latest.pt")):
+                Path(f).unlink(missing_ok=True)
+        filename = OUT_DIR / f"tahirnet_ep{epoch:03d}_{suffix}.pt"
+        torch.save(state, filename)
 
 SAMPLES    = CONFIG["sr"] * CONFIG["clip_length"]
 N_BINS     = CONFIG["n_fft"] // 2 + 1
@@ -153,15 +187,10 @@ class MECNatureDataset(Dataset):
         else:
             interf = self._norm(self._load(self.interf_files[idx]))
 
-        # Pitch / speed aug (light)
+        # Volume aug (super fast) instead of slow CPU resampling
         if self.augment and random.random() < 0.3:
-            rate  = random.uniform(0.95, 1.05)
-            nat    = torchaudio.functional.resample(
-                nat.unsqueeze(0),
-                int(self.sr * rate), self.sr
-            ).squeeze(0)[:SAMPLES]
-            if nat.shape[-1] < SAMPLES:
-                nat = F.pad(nat, (0, SAMPLES - nat.shape[-1]))
+            vol_scale = random.uniform(0.5, 1.5)
+            nat = self._norm(nat * vol_scale)
 
         snr     = random.uniform(-5, 5)
         mixture = self._mix(nat, interf, snr)
@@ -462,12 +491,12 @@ def run_epoch(model, loader, criterion, optimizer, scaler,
 
     with ctx():
         for mix, tgt in tqdm(loader, desc=desc, leave=False):
-            mix, tgt = mix.to(DEVICE), tgt.to(DEVICE)
+            mix, tgt = mix.to(DEVICE, non_blocking=True), tgt.to(DEVICE, non_blocking=True)
 
             if training:
                 optimizer.zero_grad(set_to_none=True)
 
-            with autocast():
+            with autocast('cuda'):
                 est  = model(mix)
                 loss = criterion(est, tgt)
 
@@ -496,33 +525,76 @@ def train():
         print(f"\n  DataParallel across {N_GPUS} GPUs")
         model = nn.DataParallel(model)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Parameters : {n_params:,}\n")
-
     optimizer = torch.optim.AdamW(model.parameters(),
                                   lr=CONFIG["lr"],
                                   weight_decay=CONFIG["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=5, factor=0.5, verbose=True
+        optimizer, mode="min", patience=5, factor=0.5
     )
     criterion = HybridLoss().to(DEVICE)
-    scaler    = GradScaler()
+    scaler    = GradScaler('cuda')
 
     best_val_loss   = float("inf")
     patience_ctr    = 0
     history         = []
-    t_start         = time.time()
+    start_ep        = 1
+
+    # ── RESUME CHECKPOINT LOGIC ──────────────────────────────────────
+    resume_path = CONFIG.get("resume_checkpoint", "")
+    if resume_path and Path(resume_path).exists():
+        print(f"\n🔄 Resuming from checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=DEVICE)
+        
+        # Handle state dict matching (DataParallel to single or vice versa)
+        state_dict = checkpoint.get("model_state", checkpoint)
+        new_state_dict = {}
+        is_module = any(k.startswith("module.") for k in state_dict.keys())
+        
+        for k, v in state_dict.items():
+            if is_module and N_GPUS <= 1:
+                new_state_dict[k.replace("module.", "")] = v
+            elif not is_module and N_GPUS > 1:
+                new_state_dict["module." + k] = v
+            else:
+                new_state_dict[k] = v
+                
+        model.load_state_dict(new_state_dict)
+        
+        if "opt_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["opt_state"])
+        if "scaler_state" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state"])
+        if "epoch" in checkpoint:
+            start_ep = checkpoint["epoch"] + 1
+        if "val_loss" in checkpoint:
+            best_val_loss = checkpoint["val_loss"]
+        if "history" in checkpoint:
+            history = checkpoint["history"]
+            
+        print(f"   ✅ Resumed successfully from Epoch {start_ep-1} (Best Val Loss: {best_val_loss:.4f})")
+    else:
+        if resume_path:
+            print(f"\n⚠️  Resume path not found: {resume_path}. Starting fresh training...")
+        else:
+            print("\n🚀 Starting fresh training...")
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Parameters : {n_params:,}\n")
+
+    t_start = time.time()
 
     print("=" * 70)
     print(f"{'Ep':>4} | {'T-Loss':>8} | {'T-SISNR':>8} | "
           f"{'V-Loss':>8} | {'V-SISNR':>8} | {'V-SDR':>7} | {'LR':>8} | Time")
     print("=" * 70)
 
-    for ep in range(1, CONFIG["epochs"] + 1):
+    for ep in range(start_ep, CONFIG["epochs"] + 1):
 
         # Time guard
-        if (time.time() - t_start) / 3600 >= CONFIG["time_limit_hr"]:
-            print(f"\n⏱ Time limit hit. Stopping at epoch {ep}.")
+        elapsed = (time.time() - t_start) / 3600
+        if elapsed >= CONFIG["time_limit_hr"]:
+            print(f"\n⏱ Time limit hit ({elapsed:.2f}h >= {CONFIG['time_limit_hr']}h). Saving safe checkpoint and stopping at epoch {ep-1}.")
+            save_checkpoint(model, optimizer, scaler, ep-1, best_val_loss, history, is_best=False, suffix="timeout")
             break
 
         lr = optimizer.param_groups[0]["lr"]
@@ -550,57 +622,25 @@ def train():
         if v_loss < best_val_loss:
             best_val_loss = v_loss
             patience_ctr  = 0
-            torch.save(model.state_dict(), OUT_DIR / "tahirnet_best.pt")
+            save_checkpoint(model, optimizer, scaler, ep, v_loss, history, is_best=True)
             print(f"       ✅ Best model saved  (val_loss={best_val_loss:.4f})")
         else:
             patience_ctr += 1
             if patience_ctr >= CONFIG["patience"]:
                 print(f"\n⏹ Early stopping triggered at epoch {ep}.")
+                save_checkpoint(model, optimizer, scaler, ep, v_loss, history, is_best=False, suffix="early_stop")
                 break
 
-        # Periodic checkpoint
+        # Periodic checkpoint every epoch (overwrites previous 'latest')
+        save_checkpoint(model, optimizer, scaler, ep, v_loss, history, is_best=False, suffix="latest")
+        
+        # Occasional persistent checkpoint
         if ep % 20 == 0:
-            torch.save(dict(epoch=ep,
-                            model_state=model.state_dict(),
-                            opt_state=optimizer.state_dict(),
-                            val_loss=v_loss),
-                       OUT_DIR / f"ckpt_ep{ep:03d}.pt")
+            save_checkpoint(model, optimizer, scaler, ep, v_loss, history, is_best=False, suffix="backup")
 
     pd.DataFrame(history).to_csv(OUT_DIR / "history.csv", index=False)
 
-    # ── Final Test Evaluation ────────────────────────────────
-    print("\n" + "=" * 70)
-    print("FINAL TEST EVALUATION")
-    print("=" * 70)
-
-    model.load_state_dict(torch.load(OUT_DIR / "tahirnet_best.pt"))
-    model.eval()
-    te_loss = te_sisnr = te_sdr = 0.0
-
-    with torch.no_grad():
-        for mix, tgt in tqdm(test_loader, desc="Testing"):
-            mix, tgt = mix.to(DEVICE), tgt.to(DEVICE)
-            with autocast():
-                est  = model(mix)
-                loss = criterion(est, tgt)
-            sisnr, sdr  = batch_metrics(est, tgt)
-            te_loss    += loss.item()
-            te_sisnr   += sisnr
-            te_sdr     += sdr
-
-    n = len(test_loader)
-    print(f"\n  Test Loss   : {te_loss/n:.4f}")
-    print(f"  Test SI-SDR : {te_sisnr/n:.3f} dB")
-    print(f"  Test SDR    : {te_sdr/n:.3f} dB")
-
-    # Save test results
-    pd.DataFrame([{
-        "test_loss"  : te_loss  / n,
-        "test_sisnr" : te_sisnr / n,
-        "test_sdr"   : te_sdr   / n,
-    }]).to_csv(OUT_DIR / "test_results.csv", index=False)
-
-    return model, te_sisnr / n, te_sdr / n
+    return model
 
 
 # ══════════════════════════════════════════════════════════════
@@ -638,12 +678,10 @@ def apply_pruning(model):
 # 7. ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
-model, test_sisnr, test_sdr = train()
+model = train()
 model = apply_pruning(model)
 
 print(f"\n{'='*70}")
-print(f"  TahirNet Complete!")
-print(f"  Test SI-SDR : {test_sisnr:.3f} dB")
-print(f"  Test SDR    : {test_sdr:.3f} dB")
+print(f"  TahirNet Training Complete!")
 print(f"  Outputs     : {OUT_DIR}")
 print(f"{'='*70}")
