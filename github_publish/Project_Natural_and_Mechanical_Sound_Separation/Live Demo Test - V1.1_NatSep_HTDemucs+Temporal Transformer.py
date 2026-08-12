@@ -11,20 +11,28 @@ import IPython.display as ipd
 # ⚙️ Configuration Paths (Kaggle Paths)
 # ---------------------------------------------------------
 # Kaggle model path
-MODEL_PATH = "/kaggle/input/models/inboxhasibur/v1-natsep-htdemucs-temporal-transformer/pytorch/default/1/best_model"
-# Fallback in case the path is slightly different
-if not os.path.exists(MODEL_PATH):
-    MODEL_PATH = "/kaggle/input/v1-natsep-htdemucs-temporal-transformer/pytorch/default/1/best_model"
+MODEL_PATH = "/kaggle/input/models/inboxhasibur/v1-1-natsep-htdemucs-temporal-transformer/pytorch/default/1/best_model"
 
 # 👉 PASTE THE FULL PATH TO YOUR TEST AUDIO FILE HERE
 INPUT_AUDIO_PATH = "/kaggle/input/datasets/inboxhasibur/v1-natsep-live-demo-test-data/V1_NatSep_Live_Demo_Test_Data/(Audio) Alan Walker ft Sabrina Carpenter and Farruko  - On My Way.m4a"
 
 
+# Auto-install demucs if missing (Kaggle environment support)
+try:
+    import demucs.pretrained
+except ImportError:
+    print("📦 'demucs' library not found. Auto-installing demucs...")
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "demucs"])
+    import demucs.pretrained
+    print("✅ 'demucs' successfully installed!")
+
 # ---------------------------------------------------------
-# 🧠 Model Architecture (Standalone for Kaggle)
+# 🧠 Model Architecture (True Transfer Learning)
 # ---------------------------------------------------------
 class TemporalRhythmTransformer(nn.Module):
-    def __init__(self, d_model=256, nhead=8, num_layers=2, dropout=0.15):
+    def __init__(self, d_model=8, nhead=4, num_layers=2, dropout=0.15):
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
@@ -39,64 +47,22 @@ class TemporalRhythmTransformer(nn.Module):
         out = out.view(B, T_dim, C, F_dim).permute(0, 2, 3, 1)
         return out
 
-class HeavyEncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_c, out_c * 2, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(out_c * 2)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(out_c, out_c * 2, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_c * 2)
-        )
-        
-    def forward(self, x):
-        x = self.conv1(x)
-        x = F.glu(x, dim=1)
-        x = self.conv2(x)
-        x = F.glu(x, dim=1)
-        return x
-
-class HeavyDecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c):
-        super().__init__()
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(in_c, out_c * 2, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm2d(out_c * 2)
-        )
-        self.conv = nn.Sequential(
-            nn.Conv2d(out_c, out_c * 2, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(out_c * 2)
-        )
-        
-    def forward(self, x):
-        x = self.deconv(x)
-        x = F.glu(x, dim=1)
-        x = self.conv(x)
-        x = F.glu(x, dim=1)
-        return x
-
-class HybridHTDemucsTransformer(nn.Module):
+class TrueHybridHTDemucsTRT(nn.Module):
     def __init__(self, in_channels=2, n_fft=2048, hop_length=512):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
 
-        self.enc1 = HeavyEncoderBlock(in_channels, 48)
-        self.enc2 = HeavyEncoderBlock(48, 96)
-        self.enc3 = HeavyEncoderBlock(96, 192)
-        self.enc4 = HeavyEncoderBlock(192, 384)
-        self.enc5 = HeavyEncoderBlock(384, 768)
+        print("⏳ Downloading/Loading Official Meta HTDemucs Weights...")
+        import demucs.pretrained
+        self.demucs = demucs.pretrained.get_model('htdemucs')
 
-        self.trt = TemporalRhythmTransformer(d_model=768, nhead=12, num_layers=4, dropout=0.15)
+        self.trt = TemporalRhythmTransformer(d_model=8, nhead=4, num_layers=2, dropout=0.15)
 
-        self.dec5 = HeavyDecoderBlock(768, 384)
-        self.dec4 = HeavyDecoderBlock(384, 192)
-        self.dec3 = HeavyDecoderBlock(192, 96)
-        self.dec2 = HeavyDecoderBlock(96, 48)
-        self.dec1 = nn.Sequential(
-            nn.ConvTranspose2d(48, in_channels, kernel_size=3, stride=2, padding=1, output_padding=1),
+        self.mixer = nn.Sequential(
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 2, kernel_size=3, padding=1),
             nn.Sigmoid()
         )
 
@@ -118,32 +84,23 @@ class HybridHTDemucsTransformer(nn.Module):
         return wav_flat.reshape(B, C, length)
 
     def forward(self, x):
-        spec_mag, spec_phase, L = self._stft(x)
-
-        e1 = self.enc1(spec_mag)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
-        e4 = self.enc4(e3)
-        e5 = self.enc5(e4)
-
-        B, C_bot, F_bot, T_bot = e5.shape
-        e5_time = e5.mean(dim=2, keepdim=True)
-        trt_out = self.trt(e5_time)
-        bottleneck = e5 * trt_out
-
-        d5 = self.dec5(bottleneck)
-        if d5.shape != e4.shape: d5 = F.interpolate(d5, size=e4.shape[2:], mode='bilinear', align_corners=False)
-        d4 = self.dec4(d5 + e4)
-        if d4.shape != e3.shape: d4 = F.interpolate(d4, size=e3.shape[2:], mode='bilinear', align_corners=False)
-        d3 = self.dec3(d4 + e3)
-        if d3.shape != e2.shape: d3 = F.interpolate(d3, size=e2.shape[2:], mode='bilinear', align_corners=False)
-        d2 = self.dec2(d3 + e2)
-        if d2.shape != e1.shape: d2 = F.interpolate(d2, size=e1.shape[2:], mode='bilinear', align_corners=False)
-        mask = self.dec1(d2 + e1)
-        if mask.shape != spec_mag.shape: mask = F.interpolate(mask, size=spec_mag.shape[2:], mode='bilinear', align_corners=False)
-
-        pred_mag = spec_mag * mask
-        pred_wav = self._istft(pred_mag, spec_phase, L)
+        with torch.no_grad():
+            from demucs.apply import apply_model
+            demucs_stems = apply_model(self.demucs, x) 
+            
+        B, S, C, L = demucs_stems.shape
+        stems_merged = demucs_stems.reshape(B, S * C, L)
+        stems_mag, _, _ = self._stft(stems_merged)
+        
+        stems_time = stems_mag.mean(dim=2, keepdim=True)
+        trt_out = self.trt(stems_time)
+        trt_features = stems_mag * trt_out
+        mask = self.mixer(trt_features)
+        
+        input_mag, input_phase, _ = self._stft(x)
+        pred_mag = input_mag * mask
+        pred_wav = self._istft(pred_mag, input_phase, L)
+        
         return pred_wav
 
 # ---------------------------------------------------------
@@ -203,21 +160,31 @@ def main():
     print(f"🖥️ Using device: {device}")
     
     # Initialize Model
-    print("⏳ Initializing HybridHTDemucsTransformer...")
-    model = HybridHTDemucsTransformer().to(device)
+    print("⏳ Initializing TrueHybridHTDemucsTRT...")
+    model = TrueHybridHTDemucsTRT().to(device)
     
     # Load Model Weights
     if os.path.exists(MODEL_PATH):
         model_file_to_load = MODEL_PATH
         if os.path.isdir(MODEL_PATH):
             print(f"⚠️ Model path is a directory (Kaggle automatically unzipped the .pth file). Re-packing to .pth...")
-            # We need to zip the contents of the directory, not the directory itself
-            zip_path = "/kaggle/working/temp_model"
-            shutil.make_archive(zip_path, 'zip', MODEL_PATH)
-            if os.path.exists(zip_path + ".pth"):
-                os.remove(zip_path + ".pth")
-            os.rename(zip_path + ".zip", zip_path + ".pth")
-            model_file_to_load = zip_path + ".pth"
+            import zipfile
+            zip_path = "/kaggle/working/temp_model.pth"
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            
+            # PyTorch's C++ zip reader expects the 'version' file. Adding an 'archive/' prefix
+            # and using ZIP_STORED (uncompressed) ensures maximum compatibility with torch.load.
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zipf:
+                for root, _, files in os.walk(MODEL_PATH):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(file_path, MODEL_PATH)
+                        # Add 'archive' prefix to match PyTorch's default zip structure
+                        arcname = os.path.join("archive", rel_path)
+                        zipf.write(file_path, arcname)
+                        
+            model_file_to_load = zip_path
 
         print(f"✅ Loading weights from: {model_file_to_load}")
         try:
